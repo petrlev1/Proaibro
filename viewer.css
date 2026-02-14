@@ -1,0 +1,137 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+  font-size: 15px;
+  line-height: 1.6;
+  color: #202124;
+  background: #f8f9fa;
+}
+
+.request-bar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 16px 20px;
+  background: #fff;
+  border-top: 1px solid #dadce0;
+  z-index: 11;
+  box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.query-input {
+  width: 100%;
+  margin-bottom: 12px;
+  padding: 12px 14px;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #202124;
+  border: 1px solid #dadce0;
+  border-radius: 8px;
+  resize: vertical;
+  min-height: 72px;
+}
+
+.query-input::placeholder {
+  color: #5f6368;
+}
+
+.query-input:focus {
+  outline: none;
+  border-color: #1a73e8;
+  box-shadow: 0 0 0 2px rgba(26, 115, 232, 0.2);
+}
+
+.btn-primary {
+  width: 100%;
+  padding: 10px 16px;
+  font-size: 14px;
+  font-weight: 500;
+  color: #fff;
+  background: #1a73e8;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.btn-primary:hover {
+  background: #1557b0;
+}
+
+.btn-primary:disabled {
+  background: #9aa0a6;
+  cursor: not-allowed;
+}
+
+
+.content {
+  flex: 1;
+  overflow: auto;
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 24px;
+  padding-bottom: 200px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.section-title {
+  margin: 0 0 12px 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: #202124;
+}
+
+.summary-section {
+  margin-bottom: 0;
+}
+
+.summary-content {
+  padding: 20px;
+  background: #fff;
+  border-radius: 8px;
+  border: 1px solid #e8eaed;
+  font-size: 14px;
+  line-height: 1.7;
+  color: #202124;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.loading-indicator {
+  padding: 20px;
+  text-align: center;
+  color: #5f6368;
+  font-size: 14px;
+}
+
+.text-section {
+  margin-bottom: 0;
+}
+
+.text-content {
+  margin: 0;
+  padding: 20px;
+  background: #fff;
+  border-radius: 8px;
+  border: 1px solid #e8eaed;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-size: 11px;
+  max-height: calc(100vh - 400px);
+  overflow: auto;
+}
+
+.text-content:empty::before {
+  content: 'Текст не найден.';
+  color: #5f6368;
+}

@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Proaibro</title>
+  <link rel="stylesheet" href="viewer.css">
+</head>
+<body>
+  <main class="content">
+    <section class="summary-section" id="summarySection" style="display: none;">
+      <h2 class="section-title">Ответ модели</h2>
+      <div id="summaryContent" class="summary-content"></div>
+      <div id="summaryLoading" class="loading-indicator" style="display: none;">
+        <span>Обработка запроса...</span>
+      </div>
+    </section>
+    <section class="text-section">
+      <div><strong>Вводные данные</strong></div>
+      <pre id="textContent" class="text-content"></pre>
+    </section>
+  </main>
+  <div class="request-bar">
+    <textarea id="queryInput" class="query-input" placeholder="Введите запрос к модели (например: Сделай краткое содержание текста)" rows="3"></textarea>
+    <button id="sendBtn" class="btn btn-primary">Отправить запрос</button>
+  </div>
+  <script src="viewer.js"></script>
+</body>
+</html>

@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Proaibro",
+  "version": "1.3",
+  "description": "Браузерный AI агент",
+  "permissions": ["activeTab", "scripting", "storage", "sidePanel"],
+  "host_permissions": ["<all_urls>", "https://openrouter.ai/*"],
+  "action": {
+    "default_title": "Proaibro"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "viewer.html"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["Settings.json"],
+      "matches": []
+    }
+  ]
+}
