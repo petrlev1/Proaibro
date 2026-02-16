@@ -188,15 +188,51 @@ function updateModeIndicator() {
   }
 }
 
+async function deleteChat(chatId) {
+  const chats = await getChats();
+  delete chats[chatId];
+  await chrome.storage.local.set({ [CHATS_KEY]: chats });
+  const order = await getChatOrder();
+  const newOrder = order.filter(id => id !== chatId);
+  await chrome.storage.local.set({ [CHAT_ORDER_KEY]: newOrder });
+  if (currentChatId === chatId) {
+    await newChat();
+  } else {
+    renderHistoryList();
+  }
+}
+
+async function deleteAllChats() {
+  if (!confirm('Вы уверены, что хотите удалить все чаты? Это действие нельзя отменить.')) {
+    return;
+  }
+  await chrome.storage.local.set({ [CHATS_KEY]: {}, [CHAT_ORDER_KEY]: [] });
+  await newChat();
+}
+
 async function renderHistoryList() {
   const list = getEl('historyList');
   list.innerHTML = '';
-  if (isPrivateMode) return;
+  if (isPrivateMode) {
+    getEl('deleteAllChatsBtn').style.display = 'none';
+    return;
+  }
   const order = await getChatOrder();
   const chats = await getChats();
+  if (order.length === 0) {
+    getEl('deleteAllChatsBtn').style.display = 'none';
+    const emptyMsg = document.createElement('div');
+    emptyMsg.className = 'history-empty';
+    emptyMsg.textContent = 'История пуста';
+    list.appendChild(emptyMsg);
+    return;
+  }
+  getEl('deleteAllChatsBtn').style.display = 'block';
   order.slice(0, 50).forEach(chatId => {
     const chat = chats[chatId];
     if (!chat) return;
+    const item = document.createElement('div');
+    item.className = 'history-item';
     const link = document.createElement('button');
     link.type = 'button';
     link.className = 'history-link' + (chatId === currentChatId ? ' current' : '');
@@ -204,8 +240,22 @@ async function renderHistoryList() {
     const date = new Date(chat.createdAt).toLocaleString('ru', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
     link.textContent = date + ' — ' + (title.length > 40 ? title.slice(0, 40) + '…' : title);
     link.title = title;
-    link.addEventListener('click', () => loadChat(chatId));
-    list.appendChild(link);
+    link.addEventListener('click', (e) => {
+      e.stopPropagation();
+      loadChat(chatId);
+    });
+    const deleteBtn = document.createElement('button');
+    deleteBtn.type = 'button';
+    deleteBtn.className = 'history-delete-btn';
+    deleteBtn.innerHTML = '×';
+    deleteBtn.title = 'Удалить чат';
+    deleteBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await deleteChat(chatId);
+    });
+    item.appendChild(link);
+    item.appendChild(deleteBtn);
+    list.appendChild(item);
   });
 }
 
@@ -239,6 +289,7 @@ async function initFromStorage() {
 
 getEl('newChatBtn').addEventListener('click', newChat);
 getEl('privateChatBtn').addEventListener('click', privateChat);
+getEl('deleteAllChatsBtn').addEventListener('click', deleteAllChats);
 
 document.getElementById('sendBtn').addEventListener('click', async () => {
   const btn = getEl('sendBtn');

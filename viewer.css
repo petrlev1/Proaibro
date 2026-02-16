@@ -198,6 +198,28 @@ body {
   user-select: none;
 }
 
+.history-controls {
+  margin-top: 8px;
+  margin-bottom: 8px;
+}
+
+.btn-delete-all {
+  width: 100%;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #d93025;
+  background: #fce8e6;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.btn-delete-all:hover {
+  background: #f9ab00;
+  color: #fff;
+}
+
 .history-list {
   margin-top: 8px;
   max-height: 200px;
@@ -207,9 +229,22 @@ body {
   gap: 4px;
 }
 
+.history-empty {
+  padding: 12px;
+  text-align: center;
+  color: #5f6368;
+  font-size: 12px;
+}
+
+.history-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .history-link {
+  flex: 1;
   display: block;
-  width: 100%;
   padding: 8px 10px;
   text-align: left;
   font-size: 12px;
@@ -230,6 +265,28 @@ body {
 .history-link.current {
   background: #e8f0fe;
   color: #1a73e8;
+}
+
+.history-delete-btn {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  font-size: 18px;
+  line-height: 1;
+  color: #5f6368;
+  background: #f1f3f4;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.history-delete-btn:hover {
+  background: #ea4335;
+  color: #fff;
 }
 
 /* Messages */
