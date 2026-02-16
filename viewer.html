@@ -7,10 +7,20 @@
   <link rel="stylesheet" href="viewer.css">
 </head>
 <body>
+  <header class="toolbar">
+    <div class="toolbar-buttons">
+      <button type="button" id="newChatBtn" class="btn btn-toolbar">Новый чат</button>
+      <button type="button" id="privateChatBtn" class="btn btn-toolbar btn-private">Приватный чат</button>
+    </div>
+    <div class="chat-mode-indicator" id="chatModeIndicator"></div>
+    <details class="history-details" id="historyDetails">
+      <summary>История чатов</summary>
+      <div id="historyList" class="history-list"></div>
+    </details>
+  </header>
   <main class="content">
-    <section class="summary-section" id="summarySection" style="display: none;">
-      <h2 class="section-title">Ответ модели</h2>
-      <div id="summaryContent" class="summary-content"></div>
+    <section class="messages-section" id="messagesSection">
+      <div id="messagesContainer" class="messages-container"></div>
       <div id="summaryLoading" class="loading-indicator" style="display: none;">
         <span>Обработка запроса...</span>
       </div>

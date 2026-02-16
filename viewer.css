@@ -135,3 +135,144 @@ body {
   content: 'Текст не найден.';
   color: #5f6368;
 }
+
+/* Toolbar */
+.toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: #fff;
+  border-bottom: 1px solid #dadce0;
+  padding: 10px 16px;
+  flex-shrink: 0;
+}
+
+.toolbar-buttons {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.btn-toolbar {
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #1a73e8;
+  background: #e8f0fe;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.btn-toolbar:hover {
+  background: #d2e3fc;
+}
+
+.btn-toolbar.btn-private {
+  color: #137333;
+  background: #e6f4ea;
+}
+
+.btn-toolbar.btn-private:hover {
+  background: #ceead6;
+}
+
+.chat-mode-indicator {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #5f6368;
+}
+
+.chat-mode-indicator.private {
+  color: #137333;
+}
+
+.history-details {
+  margin-top: 10px;
+  font-size: 13px;
+}
+
+.history-details summary {
+  cursor: pointer;
+  color: #1a73e8;
+  user-select: none;
+}
+
+.history-list {
+  margin-top: 8px;
+  max-height: 200px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.history-link {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  text-align: left;
+  font-size: 12px;
+  color: #202124;
+  background: #f1f3f4;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.history-link:hover {
+  background: #e8eaed;
+}
+
+.history-link.current {
+  background: #e8f0fe;
+  color: #1a73e8;
+}
+
+/* Messages */
+.messages-section {
+  margin-bottom: 16px;
+}
+
+.messages-container {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-height: 60px;
+}
+
+.message-block {
+  padding: 12px 16px;
+  border-radius: 8px;
+  max-width: 100%;
+}
+
+.message-block.message-user {
+  background: #e8f0fe;
+  align-self: flex-end;
+  margin-left: 20%;
+}
+
+.message-block.message-assistant {
+  background: #fff;
+  border: 1px solid #e8eaed;
+  align-self: flex-start;
+  margin-right: 20%;
+}
+
+.message-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #5f6368;
+  margin-bottom: 6px;
+}
+
+.message-body {
+  font-size: 14px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
