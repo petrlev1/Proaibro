@@ -71,3 +71,6 @@ model: 'qwen/qwen3-30b-a3b-thinking-2507'
 на почту: levendeevp@gmail.com<br>
 телеграм: @petrlev<br>
 max: https://max.ru/u/f9LHodD0cOLAacCyC1Nq0JZ6qonaPeCrfebj0kz2BeoJsusGlW_yQMl6k1A
+
+## Обновления
+- **17.03.26** — Добавлена возможность сохранения история чатов
