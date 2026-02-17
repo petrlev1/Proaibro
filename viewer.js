@@ -81,7 +81,22 @@ async function sendQueryToModel(text, userQuery) {
     await loadApiKey();
     if (!apiKey) throw new Error('API ключ не найден');
   }
-  const userContent = `${userQuery.trim()}\n\nТекст:\n${text.substring(0, 50000)}`;
+  const pageText = text.substring(0, 50000);
+  const systemPrompt = `Ты помощник. Тебе даётся запрос пользователя и текст открытой страницы.
+
+Правила ответа:
+1. Если ответ на запрос пользователя ЕСТЬ в тексте страницы — используй только информацию из этого текста и чётко опирайся на него.
+2. Если нужной информации в тексте страницы НЕТ или её недостаточно — ответь на запрос из своих знаний, как обычный AI-помощник, не ограничиваясь страницей.
+
+Отвечай на русском языке по существу запроса.`;
+
+  const userContent = `Запрос пользователя: ${userQuery.trim()}
+
+Текст открытой страницы (используй его, если здесь есть ответ на запрос; иначе отвечай из своих знаний):
+---
+${pageText}
+---`;
+
   const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -93,7 +108,7 @@ async function sendQueryToModel(text, userQuery) {
     body: JSON.stringify({
       model: 'qwen/qwen3-30b-a3b-thinking-2507',
       messages: [
-        { role: 'system', content: 'Ты помощник. Выполняй запрос пользователя относительно приведённого текста. Отвечай на русском языке по существу запроса.' },
+        { role: 'system', content: systemPrompt },
         { role: 'user', content: userContent }
       ],
       temperature: 0.7,
