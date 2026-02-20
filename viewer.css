@@ -177,6 +177,15 @@ body {
   background: #ceead6;
 }
 
+.btn-toolbar.btn-agent {
+  color: #c26400;
+  background: #fff4e5;
+}
+
+.btn-toolbar.btn-agent:hover {
+  background: #ffe3bf;
+}
+
 .chat-mode-indicator {
   margin-top: 8px;
   font-size: 12px;
@@ -185,6 +194,12 @@ body {
 
 .chat-mode-indicator.private {
   color: #137333;
+}
+
+.agent-mode-indicator {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #c26400;
 }
 
 .history-details {

@@ -3,6 +3,7 @@ const CHATS_KEY = 'proaibro_chats';
 const CHAT_ORDER_KEY = 'proaibro_chat_order';
 const PRIVATE_CHAT_KEY = 'proaibro_private_messages';
 const PRIVATE_MODE_KEY = 'proaibro_private_mode';
+const AGENT_MODE_KEY = 'proaibro_agent_mode';
 
 function getEl(id) {
   return document.getElementById(id);
@@ -11,6 +12,7 @@ function getEl(id) {
 let apiKey = null;
 let currentChatId = null;
 let isPrivateMode = false;
+let isAgentMode = false;
 
 async function loadApiKey() {
   try {
@@ -21,6 +23,11 @@ async function loadApiKey() {
     console.error('Failed to load API key:', err);
     return null;
   }
+}
+
+async function loadAgentModeFlag() {
+  const session = await chrome.storage.session.get([AGENT_MODE_KEY]);
+  isAgentMode = Boolean(session[AGENT_MODE_KEY]);
 }
 
 function createChatId() {
@@ -76,21 +83,32 @@ async function appendPrivateMessage(role, content) {
   await chrome.storage.session.set({ [PRIVATE_CHAT_KEY]: messages });
 }
 
-async function sendQueryToModel(text, userQuery) {
+async function sendQueryToModel(text, userQuery, agentMode) {
   if (!apiKey) {
     await loadApiKey();
     if (!apiKey) throw new Error('API ключ не найден');
   }
   const pageText = text.substring(0, 50000);
+
   const systemPrompt = `Ты помощник. Тебе даётся запрос пользователя и текст открытой страницы.
 
 Правила ответа:
 1. Если ответ на запрос пользователя ЕСТЬ в тексте страницы — используй только информацию из этого текста и чётко опирайся на него.
 2. Если нужной информации в тексте страницы НЕТ или её недостаточно — ответь на запрос из своих знаний, как обычный AI-помощник, не ограничиваясь страницей.
 
-Отвечай на русском языке по существу запроса.`;
+Если РЕЖИМ АГЕНТА ВЫКЛЮЧЕН: дай только текстовый ответ.
 
-  const userContent = `Запрос пользователя: ${userQuery.trim()}
+Если РЕЖИМ АГЕНТА ВКЛЮЧЕН: дай ДВА блока:
+— Краткий план действий (2–5 шагов)
+— JSON вида {"actions":[{"type":"input","selector":"CSS","value":"..."},{"type":"click","selector":"CSS"}]}
+   * Поддерживаемые type: "input" (ввод значения), "click" (клик).
+   * selector — CSS. Дай наиболее узкий селектор.
+   * Не больше 10 действий. Если выполнить нельзя — actions: [].
+
+Отвечай на русском языке.`;
+
+  const userContent = `Режим агента: ${agentMode ? 'ВКЛ' : 'ВЫКЛ'}
+Запрос пользователя: ${userQuery.trim()}
 
 Текст открытой страницы (используй его, если здесь есть ответ на запрос; иначе отвечай из своих знаний):
 ---
@@ -107,12 +125,13 @@ ${pageText}
     },
     body: JSON.stringify({
       model: 'qwen/qwen3-30b-a3b-thinking-2507',
+      //model: 'openai/gpt-4o-2024-11-20',
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userContent }
       ],
-      temperature: 0.7,
-      max_tokens: 2000
+      temperature: agentMode ? 0.3 : 0.7,
+      max_tokens: 2200
     })
   });
   if (!response.ok) {
@@ -152,6 +171,82 @@ function renderMessages(messages) {
     container.appendChild(block);
   });
   container.scrollTop = container.scrollHeight;
+}
+
+function safeJsonParse(text) {
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    return null;
+  }
+}
+
+function extractActionsFromResponse(text) {
+  if (!text) return null;
+  // Попытка достать JSON из markdown-блока ```json ... ```
+  const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenceMatch && fenceMatch[1]) {
+    const parsedFence = safeJsonParse(fenceMatch[1]);
+    if (parsedFence?.actions) return parsedFence;
+  }
+  // Общий поиск первого JSON-объекта
+  const braceMatch = text.match(/\{[\s\S]*\}/m);
+  if (braceMatch) {
+    const parsedBrace = safeJsonParse(braceMatch[0]);
+    if (parsedBrace?.actions) return parsedBrace;
+  }
+  return null;
+}
+
+async function runAgentActions(actions) {
+  if (!Array.isArray(actions) || actions.length === 0) return 'Нет действий для выполнения.';
+  try {
+    console.log('Agent actions:', JSON.stringify(actions));
+  } catch (_) {
+    console.log('Agent actions (non-serializable)', actions);
+  }
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.id) return 'Не удалось получить активную вкладку для агента.';
+
+  const results = [];
+  for (const action of actions.slice(0, 10)) {
+    const { type, selector, value } = action || {};
+    const safeValue = value == null ? '' : String(value);
+    if (!type || !selector) {
+      results.push('Пропущено действие без type/selector');
+      continue;
+    }
+    try {
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        args: [type, selector, safeValue],
+        func: (aType, aSelector, aValue) => {
+          const el = document.querySelector(aSelector);
+          if (!el) return `Элемент не найден: ${aSelector}`;
+          if (aType === 'click') {
+            el.focus?.();
+            el.click();
+            return `Клик по ${aSelector}`;
+          }
+          if (aType === 'input') {
+            if ('value' in el) {
+              el.focus?.();
+              el.value = aValue ?? '';
+              el.dispatchEvent(new Event('input', { bubbles: true }));
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+              return `Ввод в ${aSelector}: ${aValue}`;
+            }
+            return `Элемент не поддерживает value: ${aSelector}`;
+          }
+          return `Неизвестный тип действия: ${aType}`;
+        }
+      });
+      results.push(res?.result || 'Действие выполнено');
+    } catch (err) {
+      results.push(`Ошибка при ${type}:${selector} — ${err.message}`);
+    }
+  }
+  return results.join('\n');
 }
 
 async function loadChat(chatId) {
@@ -200,6 +295,17 @@ function updateModeIndicator() {
   } else {
     el.textContent = 'Обычный чат (сохраняется)';
     el.className = 'chat-mode-indicator normal';
+  }
+
+  const agentEl = getEl('agentModeIndicator');
+  if (agentEl) {
+    if (isAgentMode) {
+      agentEl.textContent = 'Режим агента включен: модель попробует выполнить действия на странице';
+      agentEl.className = 'agent-mode-indicator on';
+    } else {
+      agentEl.textContent = 'Режим агента выключен: ответы только текстом';
+      agentEl.className = 'agent-mode-indicator off';
+    }
   }
 }
 
@@ -289,6 +395,7 @@ async function initFromStorage() {
     }
   }
   const session = await chrome.storage.session.get([PRIVATE_MODE_KEY, PRIVATE_CHAT_KEY]);
+  await loadAgentModeFlag();
   if (session[PRIVATE_MODE_KEY] && Array.isArray(session[PRIVATE_CHAT_KEY])) {
     isPrivateMode = true;
     currentChatId = null;
@@ -300,11 +407,22 @@ async function initFromStorage() {
   }
   updateModeIndicator();
   renderHistoryList();
+
+  const agentBtn = getEl('agentModeBtn');
+  if (agentBtn) {
+    agentBtn.textContent = 'Агент: ' + (isAgentMode ? 'вкл' : 'выкл');
+  }
 }
 
 getEl('newChatBtn').addEventListener('click', newChat);
 getEl('privateChatBtn').addEventListener('click', privateChat);
 getEl('deleteAllChatsBtn').addEventListener('click', deleteAllChats);
+getEl('agentModeBtn').addEventListener('click', async () => {
+  isAgentMode = !isAgentMode;
+  await chrome.storage.session.set({ [AGENT_MODE_KEY]: isAgentMode });
+  getEl('agentModeBtn').textContent = 'Агент: ' + (isAgentMode ? 'вкл' : 'выкл');
+  updateModeIndicator();
+});
 
 document.getElementById('sendBtn').addEventListener('click', async () => {
   const btn = getEl('sendBtn');
@@ -357,7 +475,7 @@ document.getElementById('sendBtn').addEventListener('click', async () => {
     getEl('summaryLoading').style.display = 'block';
     let responseText;
     try {
-      responseText = await sendQueryToModel(text, userQuery);
+      responseText = await sendQueryToModel(text, userQuery, isAgentMode);
     } catch (err) {
       console.error('Query failed:', err);
       responseText = 'Ошибка: ' + err.message;
@@ -378,6 +496,36 @@ document.getElementById('sendBtn').addEventListener('click', async () => {
       const chats = await getChats();
       renderMessages((chats[currentChatId] || {}).messages || []);
       renderHistoryList();
+    }
+
+    if (isAgentMode) {
+      const parsed = extractActionsFromResponse(responseText);
+      if (parsed?.actions) {
+        const execResult = await runAgentActions(parsed.actions);
+        const followup = `Результат выполнения действий:\n${execResult}`;
+        if (isPrivateMode) {
+          await appendPrivateMessage('assistant', followup);
+          const messages = await getPrivateMessages();
+          renderMessages(messages);
+        } else {
+          await appendMessageToLocalChat(currentChatId, 'assistant', followup);
+          const chats = await getChats();
+          renderMessages((chats[currentChatId] || {}).messages || []);
+          renderHistoryList();
+        }
+      } else {
+        const notice = 'Агент: действий не найдено или JSON нераспознан.';
+        if (isPrivateMode) {
+          await appendPrivateMessage('assistant', notice);
+          const messages = await getPrivateMessages();
+          renderMessages(messages);
+        } else {
+          await appendMessageToLocalChat(currentChatId, 'assistant', notice);
+          const chats = await getChats();
+          renderMessages((chats[currentChatId] || {}).messages || []);
+          renderHistoryList();
+        }
+      }
     }
 
     queryInput.value = '';
