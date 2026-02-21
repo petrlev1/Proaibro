@@ -4,6 +4,9 @@ const CHAT_ORDER_KEY = 'proaibro_chat_order';
 const PRIVATE_CHAT_KEY = 'proaibro_private_messages';
 const PRIVATE_MODE_KEY = 'proaibro_private_mode';
 const AGENT_MODE_KEY = 'proaibro_agent_mode';
+const SCREENSHOT_MAX_SIDE = 1024;
+const SCREENSHOT_JPEG_QUALITY = 0.6;
+const SCREENSHOT_MAX_CHARS = 120000; // защита от переполнения промпта
 
 function getEl(id) {
   return document.getElementById(id);
@@ -28,6 +31,55 @@ async function loadApiKey() {
 async function loadAgentModeFlag() {
   const session = await chrome.storage.session.get([AGENT_MODE_KEY]);
   isAgentMode = Boolean(session[AGENT_MODE_KEY]);
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function captureTabScreenshot() {
+  try {
+    const dataUrl = await chrome.tabs.captureVisibleTab({ format: 'png' });
+    return dataUrl || null;
+  } catch (err) {
+    console.warn('captureVisibleTab failed', err);
+    return null;
+  }
+}
+
+async function compressDataUrlPngToJpeg(dataUrl, maxSide = SCREENSHOT_MAX_SIDE, quality = SCREENSHOT_JPEG_QUALITY) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const { width, height } = img;
+        const scale = Math.min(1, maxSide / Math.max(width, height));
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(width * scale));
+        canvas.height = Math.max(1, Math.round(height * scale));
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        const jpegUrl = canvas.toDataURL('image/jpeg', quality);
+        resolve(jpegUrl);
+      } catch (e) {
+        reject(e);
+      }
+    };
+    img.onerror = reject;
+    img.src = dataUrl;
+  });
+}
+
+async function getCompressedScreenshotDataUrl() {
+  const raw = await captureTabScreenshot();
+  if (!raw) return null;
+  try {
+    const jpeg = await compressDataUrlPngToJpeg(raw);
+    return jpeg;
+  } catch (err) {
+    console.warn('compress screenshot failed, using raw', err);
+    return raw;
+  }
 }
 
 function createChatId() {
@@ -83,37 +135,53 @@ async function appendPrivateMessage(role, content) {
   await chrome.storage.session.set({ [PRIVATE_CHAT_KEY]: messages });
 }
 
-async function sendQueryToModel(text, userQuery, agentMode) {
+async function sendQueryToModel(text, userQuery, agentMode, screenshotDataUrl) {
   if (!apiKey) {
     await loadApiKey();
     if (!apiKey) throw new Error('API ключ не найден');
   }
-  const pageText = text.substring(0, 50000);
+  const pageText = (text || '').substring(0, 50000);
+  const hasTextContent = pageText.trim().length > 0;
+  const hasScreenshot = Boolean(screenshotDataUrl);
+  const screenshotInfo = hasScreenshot ? 'Скриншот приложен (JPEG data URL).' : 'Скриншот недоступен или не смог быть снят.';
+  const textInfo = hasTextContent ? 'Текст страницы получен.' : 'Текст страницы отсутствует или пуст.';
 
-  const systemPrompt = `Ты помощник. Тебе даётся запрос пользователя и текст открытой страницы.
+  const systemPrompt = `Ты помощник. Тебе даётся запрос пользователя, текст открытой страницы и (если есть) скриншот страницы.
 
 Правила ответа:
-1. Если ответ на запрос пользователя ЕСТЬ в тексте страницы — используй только информацию из этого текста и чётко опирайся на него.
-2. Если нужной информации в тексте страницы НЕТ или её недостаточно — ответь на запрос из своих знаний, как обычный AI-помощник, не ограничиваясь страницей.
+1. Если ответ на запрос пользователя ЕСТЬ в тексте страницы или на скриншоте — опирайся на эти данные.
+2. Если нужной информации нет или её недостаточно — ответь из своих знаний.
+3. Если текста нет, опирайся только на скриншот. Если нет ни текста, ни скриншота — отвечай из общих знаний.
 
 Если РЕЖИМ АГЕНТА ВЫКЛЮЧЕН: дай только текстовый ответ.
 
 Если РЕЖИМ АГЕНТА ВКЛЮЧЕН: дай ДВА блока:
 — Краткий план действий (2–5 шагов)
 — JSON вида {"actions":[{"type":"input","selector":"CSS","value":"..."},{"type":"click","selector":"CSS"}]}
-   * Поддерживаемые type: "input" (ввод значения), "click" (клик).
-   * selector — CSS. Дай наиболее узкий селектор.
+   * Поддерживаемые type: "input" (ввод текста), "click" (клик мышью), "move" (подвести курсор к элементу для наведения/hover), "wait" (пауза в миллисекундах).
+   * Для input/click/move обязателен selector (CSS). Дай наиболее узкий селектор.
+   * Для click можно указать button: "left" | "right" | "middle" (по умолчанию left).
+   * Для wait укажи поле ms (0–4000).
    * Не больше 10 действий. Если выполнить нельзя — actions: [].
 
 Отвечай на русском языке.`;
 
-  const userContent = `Режим агента: ${agentMode ? 'ВКЛ' : 'ВЫКЛ'}
+  const userText = `Режим агента: ${agentMode ? 'ВКЛ' : 'ВЫКЛ'}
 Запрос пользователя: ${userQuery.trim()}
+${textInfo}
+${screenshotInfo}
 
-Текст открытой страницы (используй его, если здесь есть ответ на запрос; иначе отвечай из своих знаний):
+Текст открытой страницы (если пустой — опирайся на скриншот или отвечай из знаний):
 ---
 ${pageText}
 ---`;
+
+  const userMessage = screenshotDataUrl
+    ? { role: 'user', content: [
+        { type: 'text', text: userText },
+        { type: 'image_url', image_url: { url: screenshotDataUrl, detail: 'low' } }
+      ] }
+    : { role: 'user', content: userText };
 
   const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
@@ -124,13 +192,12 @@ ${pageText}
       'X-Title': 'Proaibro'
     },
     body: JSON.stringify({
-      model: 'qwen/qwen3-30b-a3b-thinking-2507',
-      //model: 'openai/gpt-4o-2024-11-20',
+      model: 'openai/gpt-4o-mini',
       messages: [
         { role: 'system', content: systemPrompt },
-        { role: 'user', content: userContent }
+        userMessage
       ],
-      temperature: agentMode ? 0.3 : 0.7,
+      temperature: agentMode ? 0.25 : 0.7,
       max_tokens: 2200
     })
   });
@@ -210,23 +277,41 @@ async function runAgentActions(actions) {
 
   const results = [];
   for (const action of actions.slice(0, 10)) {
-    const { type, selector, value } = action || {};
+    const { type, selector, value, button, ms } = action || {};
     const safeValue = value == null ? '' : String(value);
-    if (!type || !selector) {
-      results.push('Пропущено действие без type/selector');
+    const safeButton = button || 'left';
+    if (!type) {
+      results.push('Пропущено действие без type');
       continue;
     }
+    if ((type === 'click' || type === 'input' || type === 'move') && !selector) {
+      results.push(`Пропущено ${type} без selector`);
+      continue;
+    }
+
+    if (type === 'wait') {
+      const dur = Math.min(Math.max(Number(ms) || 0, 0), 4000);
+      await sleep(dur);
+      results.push(`Ожидание ${dur} мс`);
+      continue;
+    }
+
     try {
       const [res] = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        args: [type, selector, safeValue],
-        func: (aType, aSelector, aValue) => {
-          const el = document.querySelector(aSelector);
+        args: [type, selector, safeValue, safeButton],
+        func: (aType, aSelector, aValue, aButton) => {
+          const el = aSelector ? document.querySelector(aSelector) : null;
+          if (aType === 'move') {
+            if (!el) return `Элемент не найден для move: ${aSelector}`;
+            el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'smooth' });
+            return `Навели курсор (scrollIntoView) на ${aSelector}`;
+          }
           if (!el) return `Элемент не найден: ${aSelector}`;
           if (aType === 'click') {
             el.focus?.();
-            el.click();
-            return `Клик по ${aSelector}`;
+            el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: aButton === 'right' ? 2 : aButton === 'middle' ? 1 : 0 }));
+            return `Клик (${aButton}) по ${aSelector}`;
           }
           if (aType === 'input') {
             if ('value' in el) {
@@ -243,7 +328,7 @@ async function runAgentActions(actions) {
       });
       results.push(res?.result || 'Действие выполнено');
     } catch (err) {
-      results.push(`Ошибка при ${type}:${selector} — ${err.message}`);
+      results.push(`Ошибка при ${type}:${selector || ''} — ${err.message}`);
     }
   }
   return results.join('\n');
@@ -452,18 +537,8 @@ document.getElementById('sendBtn').addEventListener('click', async () => {
       })
     });
 
-    if (!results?.[0]?.result) {
-      btn.textContent = 'Не удалось прочитать страницу (chrome://?)';
-      btn.disabled = false;
-      return;
-    }
-
-    const { title, text } = results[0].result;
-    if (!text || text.trim().length === 0) {
-      btn.textContent = 'Данных пока нет';
-      btn.disabled = false;
-      return;
-    }
+    const extracted = results?.[0]?.result || { title: tab.title || 'Без названия', text: '' };
+    const { title, text } = extracted;
 
     await chrome.storage.session.set({
       pageExtractedTitle: title,
@@ -473,9 +548,13 @@ document.getElementById('sendBtn').addEventListener('click', async () => {
     await loadPageFromStorage();
 
     getEl('summaryLoading').style.display = 'block';
+    const screenshotDataUrl = await getCompressedScreenshotDataUrl();
     let responseText;
     try {
-      responseText = await sendQueryToModel(text, userQuery, isAgentMode);
+      const trimmedScreenshot = screenshotDataUrl && screenshotDataUrl.length > SCREENSHOT_MAX_CHARS
+        ? screenshotDataUrl.slice(0, SCREENSHOT_MAX_CHARS)
+        : screenshotDataUrl;
+      responseText = await sendQueryToModel(text, userQuery, isAgentMode, trimmedScreenshot);
     } catch (err) {
       console.error('Query failed:', err);
       responseText = 'Ошибка: ' + err.message;
