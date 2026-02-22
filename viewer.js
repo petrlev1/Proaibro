@@ -163,13 +163,14 @@ async function sendQueryToModel(text, userQuery, agentMode, screenshotDataUrl, i
 — Краткий план действий (2–5 шагов)
 — JSON вида {"actions":[{"type":"input","selector":"CSS","value":"..."},{"type":"click","selector":"CSS"}]}
    * Поддерживаемые type: "input" (ввод текста), "click" (клик мышью), "move" (прокрутка и подвод курсора), "wait" (пауза в мс), "press" (клавиши), "focus" (фокус), "select" (выбор в <select>), "ocr_input" (ввод в поле, найденное по тексту на скриншоте), "ocr_click" (клик по элементу/кнопке, найденным по тексту на скриншоте).
-   * Для input/click/move/focus/select обязателен selector (CSS). Можно указать несколько селекторов через "||" — пробуй слева направо. Для ocr_input/ocr_click селектор не обязателен, но можно добавить, если известен.
+   * Для input/click/move/focus/select обязателен selector (CSS) ИЛИ точные координаты x и y (если можешь определить их по скриншоту). Можно указать несколько селекторов через "||" — пробуй слева направо. Для ocr_input/ocr_click селектор не обязателен, но можно добавить, если известен.
    * Для click можно указать button: "left" | "right" | "middle" (по умолчанию left).
    * Для wait укажи поле ms (0–4000).
    * Для press укажи keys (например: "Enter", "Tab", "ArrowDown", "Escape").
    * Для select укажи value ИЛИ label ИЛИ index.
    * Для ocr_input: укажи text (что ввести) и near (ключевые слова/ярлыки поля, например: "Откуда", "From"), чтобы модель подобрала поле по скриншоту/DOM-инвентарю.
    * Для ocr_click: укажи near (текст на кнопке/рядом), чтобы кликнуть по элементу, найденному по скриншоту/DOM-инвентарю.
+   * Если ты видишь элемент на скриншоте, но не знаешь его селектор, ты можешь передать точные координаты x и y (в пикселях от левого верхнего угла страницы) для любого действия (click, input, move).
    * Не больше ${MAX_ACTIONS} действий. Если выполнить нельзя — actions: [].
    * JSON должен быть валидным, без комментариев, и быть единственным JSON-блоком в формате \`\`\`json ... \`\`\`.
 
@@ -315,8 +316,8 @@ async function runAgentActions(actions) {
     }
 
     try {
-      const [res] = await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
+      const resultsArr = await chrome.scripting.executeScript({
+        target: { tabId: tab.id, allFrames: true },
         args: [
           type,
           selector || null,
@@ -346,7 +347,19 @@ async function runAgentActions(actions) {
                   const result = document.evaluate(p, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
                   if (result.singleNodeValue) return result.singleNodeValue;
                 } else {
-                  const found = document.querySelector(p);
+                  const querySelectorDeep = (selector, root = document) => {
+                    const el = root.querySelector(selector);
+                    if (el) return el;
+                    const elements = root.querySelectorAll('*');
+                    for (const e of elements) {
+                      if (e.shadowRoot) {
+                        const found = querySelectorDeep(selector, e.shadowRoot);
+                        if (found) return found;
+                      }
+                    }
+                    return null;
+                  };
+                  const found = querySelectorDeep(p);
                   if (found) return found;
                 }
               } catch (e) {
@@ -363,17 +376,40 @@ async function runAgentActions(actions) {
             // 1. Try domInventory
             const items = Array.isArray(domInventory) ? domInventory : [];
             const candidates = items.filter(it => (role ? it.role === role : true) && it.text.toLowerCase().includes(needle));
+            const querySelectorDeep = (selector, root = document) => {
+              const el = root.querySelector(selector);
+              if (el) return el;
+              const elements = root.querySelectorAll('*');
+              for (const e of elements) {
+                if (e.shadowRoot) {
+                  const found = querySelectorDeep(selector, e.shadowRoot);
+                  if (found) return found;
+                }
+              }
+              return null;
+            };
+
             if (candidates.length > 0) {
               for (const target of candidates) {
                 try {
-                  const el = document.querySelector(target.selector);
+                  const el = querySelectorDeep(target.selector);
                   if (el) return el;
                 } catch(e) {}
               }
             }
             
+            const querySelectorAllDeep = (selector, root = document) => {
+              const result = [];
+              const elements = root.querySelectorAll('*');
+              for (const el of elements) {
+                if (el.matches && el.matches(selector)) result.push(el);
+                if (el.shadowRoot) result.push(...querySelectorAllDeep(selector, el.shadowRoot));
+              }
+              return result;
+            };
+
             // 2. Fallback: search DOM for text
-            const allElements = Array.from(document.querySelectorAll(role === 'button' ? 'button, [role="button"], a' : 'input, textarea, select, [role="textbox"], [contenteditable="true"]'));
+            const allElements = querySelectorAllDeep(role === 'button' ? 'button, [role="button"], a' : 'input, textarea, select, [role="textbox"], [contenteditable="true"]');
             for (const el of allElements) {
               let text = '';
               if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
@@ -381,7 +417,8 @@ async function runAgentActions(actions) {
                 if (el.labels && el.labels.length > 0) {
                   text += ' ' + Array.from(el.labels).map(l => l.innerText || l.textContent).join(' ');
                 } else if (el.id) {
-                  const label = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+                  const root = el.getRootNode();
+                  const label = root.querySelector(`label[for="${CSS.escape(el.id)}"]`);
                   if (label) text += ' ' + (label.innerText || label.textContent);
                 }
                 if (el.parentElement) {
@@ -396,11 +433,25 @@ async function runAgentActions(actions) {
             }
             
             // 3. If still not found, find any element containing the text
-            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
-            let node;
-            while (node = walker.nextNode()) {
-              if (node.nodeValue.toLowerCase().includes(needle)) {
-                let parent = node.parentElement;
+            const searchInShadowDOM = (root, needle) => {
+              const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
+              let node;
+              while (node = walker.nextNode()) {
+                if (node.nodeValue.toLowerCase().includes(needle)) return node;
+              }
+              const elements = root.querySelectorAll('*');
+              for (const el of elements) {
+                if (el.shadowRoot) {
+                  const found = searchInShadowDOM(el.shadowRoot, needle);
+                  if (found) return found;
+                }
+              }
+              return null;
+            };
+
+            const node = searchInShadowDOM(document.body, needle);
+            if (node) {
+              let parent = node.parentElement;
                 if (role === 'button') {
                   while (parent && parent !== document.body) {
                     if (parent.tagName === 'BUTTON' || parent.tagName === 'A' || parent.getAttribute('role') === 'button' || parent.onclick) {
@@ -409,14 +460,24 @@ async function runAgentActions(actions) {
                     parent = parent.parentElement;
                   }
                 } else if (role === 'input') {
-                  while (parent && parent !== document.body) {
-                    const input = parent.querySelector('input, textarea, select');
+                  let p = parent;
+                  while (p && p !== document.body) {
+                    const input = p.querySelector('input, textarea, select, [contenteditable="true"]');
                     if (input) return input;
-                    parent = parent.parentElement;
+                    p = p.parentElement;
+                  }
+                  p = parent;
+                  while (p && p !== document.body) {
+                    let sibling = p.nextElementSibling;
+                    while (sibling) {
+                      const input = sibling.matches('input, textarea, select, [contenteditable="true"]') ? sibling : sibling.querySelector('input, textarea, select, [contenteditable="true"]');
+                      if (input) return input;
+                      sibling = sibling.nextElementSibling;
+                    }
+                    p = p.parentElement;
                   }
                 }
                 return node.parentElement;
-              }
             }
             
             return null;
@@ -517,6 +578,12 @@ async function runAgentActions(actions) {
           }
 
           if (aType === 'input' || aType === 'ocr_input') {
+            if (!('value' in targetEl) && !targetEl.isContentEditable) {
+              if (document.activeElement && ('value' in document.activeElement || document.activeElement.isContentEditable)) {
+                targetEl = document.activeElement;
+              }
+            }
+            
             if ('value' in targetEl || targetEl.isContentEditable) {
               targetEl.focus?.();
               await moveFakeCursor(targetEl, aX, aY);
@@ -542,7 +609,7 @@ async function runAgentActions(actions) {
               targetEl.dispatchEvent(new Event('change', { bubbles: true }));
               return `Ввод в ${aSelector || aNear || `[${aX},${aY}]`}: ${textToType}`;
             }
-            return `Элемент не поддерживает value: ${aSelector || aNear || `[${aX},${aY}]`}`;
+            return `Элемент (${targetEl.tagName}) не поддерживает value: ${aSelector || aNear || `[${aX},${aY}]`}`;
           }
 
           if (aType === 'select') {
@@ -574,7 +641,18 @@ async function runAgentActions(actions) {
           return `Неизвестный тип действия: ${aType}`;
         }
       });
-      results.push(res?.result || 'Действие выполнено');
+      
+      let successRes = null;
+      let errorRes = null;
+      for (const r of resultsArr) {
+        if (r.result && !r.result.startsWith('Элемент не найден')) {
+          successRes = r.result;
+          break;
+        } else if (r.result) {
+          errorRes = r.result;
+        }
+      }
+      results.push(successRes || errorRes || 'Действие выполнено');
     } catch (err) {
       results.push(`Ошибка при ${type}:${selector || ''} — ${err.message}`);
     }
@@ -584,12 +662,22 @@ async function runAgentActions(actions) {
 
 async function buildDomInventory(tabId) {
   try {
-    const [res] = await chrome.scripting.executeScript({
-      target: { tabId },
+    const resultsArr = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
       args: [INVENTORY_LIMIT, INVENTORY_TEXT_MAX],
       func: (limit, textMax) => {
+        const querySelectorAllDeep = (selector, root = document) => {
+          const result = [];
+          const elements = root.querySelectorAll('*');
+          for (const el of elements) {
+            if (el.matches && el.matches(selector)) result.push(el);
+            if (el.shadowRoot) result.push(...querySelectorAllDeep(selector, el.shadowRoot));
+          }
+          return result;
+        };
+
         const items = [];
-        const nodes = Array.from(document.querySelectorAll('input, textarea, button, select, [role="button"], [role="textbox"], [contenteditable="true"]'));
+        const nodes = querySelectorAllDeep('input, textarea, button, select, [role="button"], [role="textbox"], [contenteditable="true"]');
         for (const el of nodes.slice(0, limit)) {
           let text = '';
           if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
@@ -634,7 +722,15 @@ async function buildDomInventory(tabId) {
         }
       }
     });
-    if (res?.result && Array.isArray(res.result)) return res.result;
+    let allItems = [];
+    if (resultsArr && Array.isArray(resultsArr)) {
+      for (const r of resultsArr) {
+        if (r.result && Array.isArray(r.result)) {
+          allItems = allItems.concat(r.result);
+        }
+      }
+    }
+    return allItems;
   } catch (err) {
     console.warn('buildDomInventory failed', err);
   }
