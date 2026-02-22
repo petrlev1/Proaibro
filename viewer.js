@@ -546,7 +546,7 @@ async function runAgentActions(actions) {
             const key = aKeys || '';
             const tgt = targetEl || document.activeElement || document.body;
             if (!tgt) return 'Нет элемента для press';
-            const eventInit = { key, code: key, bubbles: true, cancelable: true };
+            const eventInit = { key, code: key, bubbles: true, cancelable: true, composed: true, view: window };
             tgt.dispatchEvent(new KeyboardEvent('keydown', eventInit));
             tgt.dispatchEvent(new KeyboardEvent('keypress', eventInit));
             tgt.dispatchEvent(new KeyboardEvent('keyup', eventInit));
@@ -570,8 +570,10 @@ async function runAgentActions(actions) {
             }
 
             const btn = aButton === 'right' ? 2 : aButton === 'middle' ? 1 : 0;
-            const eventInit = { bubbles: true, cancelable: true, clientX: coords.x, clientY: coords.y, button: btn };
+            const eventInit = { bubbles: true, cancelable: true, composed: true, view: window, clientX: coords.x, clientY: coords.y, button: btn, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+            targetEl.dispatchEvent(new PointerEvent('pointerdown', eventInit));
             targetEl.dispatchEvent(new MouseEvent('mousedown', eventInit));
+            targetEl.dispatchEvent(new PointerEvent('pointerup', eventInit));
             targetEl.dispatchEvent(new MouseEvent('mouseup', eventInit));
             targetEl.dispatchEvent(new MouseEvent('click', eventInit));
             return `Клик (${aButton}) по ${aSelector || aNear || `[${aX},${aY}]`}`;
@@ -605,8 +607,8 @@ async function runAgentActions(actions) {
                 }
               }
               
-              targetEl.dispatchEvent(new Event('input', { bubbles: true }));
-              targetEl.dispatchEvent(new Event('change', { bubbles: true }));
+              targetEl.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+              targetEl.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
               return `Ввод в ${aSelector || aNear || `[${aX},${aY}]`}: ${textToType}`;
             }
             return `Элемент (${targetEl.tagName}) не поддерживает value: ${aSelector || aNear || `[${aX},${aY}]`}`;
