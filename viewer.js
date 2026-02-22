@@ -162,7 +162,7 @@ async function sendQueryToModel(text, userQuery, agentMode, screenshotDataUrl, i
 Если РЕЖИМ АГЕНТА ВКЛЮЧЕН: дай ДВА блока:
 — Краткий план действий (2–5 шагов)
 — JSON вида {"actions":[{"type":"input","selector":"CSS","value":"..."},{"type":"click","selector":"CSS"}]}
-   * Поддерживаемые type: "input" (ввод текста), "click" (клик мышью), "move" (прокрутка и подвод курсора), "wait" (пауза в мс), "press" (клавиши), "focus" (фокус), "select" (выбор в <select>), "ocr_input" (ввод в поле, найденное по тексту на скриншоте), "ocr_click" (клик по элементу/кнопке, найденным по тексту на скриншоте).
+   * Поддерживаемые type: "input" (ввод текста), "click" (клик мышью), "move" (прокрутка и подвод курсора), "wait" (пауза в мс), "press" (клавиши), "focus" (фокус), "select" (выбор в <select>), "ocr_input" (ввод в поле, найденное по тексту на скриншоте), "ocr_click" (клик по элементу/кнопке, найденным по тексту на скриншоте), "finish" (завершение работы).
    * Для input/click/move/focus/select обязателен selector (CSS) ИЛИ точные координаты x и y (если можешь определить их по скриншоту). Можно указать несколько селекторов через "||" — пробуй слева направо. Для ocr_input/ocr_click селектор не обязателен, но можно добавить, если известен.
    * Для click можно указать button: "left" | "right" | "middle" (по умолчанию left).
    * Для wait укажи поле ms (0–4000).
@@ -171,6 +171,7 @@ async function sendQueryToModel(text, userQuery, agentMode, screenshotDataUrl, i
    * Для ocr_input: укажи text (что ввести) и near (ключевые слова/ярлыки поля, например: "Откуда", "From"), чтобы модель подобрала поле по скриншоту/DOM-инвентарю.
    * Для ocr_click: укажи near (текст на кнопке/рядом), чтобы кликнуть по элементу, найденному по скриншоту/DOM-инвентарю.
    * Если ты видишь элемент на скриншоте, но не знаешь его селектор, ты можешь передать точные координаты x и y (в пикселях от левого верхнего угла страницы) для любого действия (click, input, move).
+   * Если ты выполнил задачу пользователя и видишь результат на странице, ОБЯЗАТЕЛЬНО добавь действие {"type": "finish", "text": "Твой финальный ответ пользователю"}. Без этого действия ты будешь вызываться снова и снова!
    * Не больше ${MAX_ACTIONS} действий. Если выполнить нельзя — actions: [].
    * JSON должен быть валидным, без комментариев, и быть единственным JSON-блоком в формате \`\`\`json ... \`\`\`.
 
@@ -308,6 +309,11 @@ async function runAgentActions(actions) {
       continue;
     }
 
+    if (type === 'finish') {
+      results.push(`Агент завершил работу: ${text || safeValue || ''}`);
+      continue;
+    }
+
     if (type === 'wait') {
       const dur = Math.min(Math.max(Number(ms) || 0, 0), 4000);
       await sleep(dur);
@@ -335,7 +341,13 @@ async function runAgentActions(actions) {
         func: async (aType, aSelector, aValue, aButton, aKeys, aLabel, aIndex, aNear, aText, domInventory, aX, aY) => {
           let targetEl = null;
           if (aX != null && aY != null) {
-            targetEl = document.elementFromPoint(aX, aY);
+            let el = document.elementFromPoint(aX, aY);
+            while (el && el.shadowRoot) {
+              const innerEl = el.shadowRoot.elementFromPoint(aX, aY);
+              if (!innerEl || innerEl === el) break;
+              el = innerEl;
+            }
+            targetEl = el;
           }
 
           const pickElement = (sel) => {
@@ -544,7 +556,11 @@ async function runAgentActions(actions) {
 
           if (aType === 'press') {
             const key = aKeys || '';
-            const tgt = targetEl || document.activeElement || document.body;
+            let active = document.activeElement;
+            while (active && active.shadowRoot && active.shadowRoot.activeElement) {
+              active = active.shadowRoot.activeElement;
+            }
+            const tgt = targetEl || active || document.body;
             if (!tgt) return 'Нет элемента для press';
             const eventInit = { key, code: key, bubbles: true, cancelable: true, composed: true, view: window };
             tgt.dispatchEvent(new KeyboardEvent('keydown', eventInit));
@@ -581,8 +597,12 @@ async function runAgentActions(actions) {
 
           if (aType === 'input' || aType === 'ocr_input') {
             if (!('value' in targetEl) && !targetEl.isContentEditable) {
-              if (document.activeElement && ('value' in document.activeElement || document.activeElement.isContentEditable)) {
-                targetEl = document.activeElement;
+              let active = document.activeElement;
+              while (active && active.shadowRoot && active.shadowRoot.activeElement) {
+                active = active.shadowRoot.activeElement;
+              }
+              if (active && ('value' in active || active.isContentEditable)) {
+                targetEl = active;
               }
             }
             
@@ -931,7 +951,18 @@ getEl('agentModeBtn').addEventListener('click', async () => {
   updateModeIndicator();
 });
 
+let isAgentRunning = false;
+
+getEl('stopAgentBtn').addEventListener('click', () => {
+  isAgentRunning = false;
+  getEl('stopAgentBtn').style.display = 'none';
+  getEl('sendBtn').disabled = false;
+  getEl('sendBtn').textContent = 'Отправить запрос';
+});
+
 document.getElementById('sendBtn').addEventListener('click', async () => {
+  if (isAgentRunning) return;
+  
   const btn = getEl('sendBtn');
   const queryInput = getEl('queryInput');
   const userQuery = queryInput.value.trim();
@@ -940,72 +971,89 @@ document.getElementById('sendBtn').addEventListener('click', async () => {
     return;
   }
 
+  isAgentRunning = true;
   btn.disabled = true;
   btn.textContent = 'Обработка...';
+  if (isAgentMode) {
+    getEl('stopAgentBtn').style.display = 'inline-block';
+  }
 
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab?.id) {
-      btn.textContent = 'Ошибка: нет вкладки';
-      btn.disabled = false;
-      return;
-    }
+    let currentQuery = userQuery;
+    let iteration = 0;
+    const maxIterations = 10;
 
-    const results = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: () => ({
-        title: document.title || 'Без названия',
-        text: document.body ? document.body.innerText : ''
-      })
-    });
+    while (isAgentRunning && iteration < maxIterations) {
+      iteration++;
+      
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab?.id) {
+        btn.textContent = 'Ошибка: нет вкладки';
+        break;
+      }
 
-    const extracted = results?.[0]?.result || { title: tab.title || 'Без названия', text: '' };
-    const { title, text } = extracted;
+      const results = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: () => ({
+          title: document.title || 'Без названия',
+          text: document.body ? document.body.innerText : ''
+        })
+      });
 
-    await chrome.storage.session.set({
-      pageExtractedTitle: title,
-      pageExtractedText: text,
-      pageExtractedUrl: tab.url || ''
-    });
-    await loadPageFromStorage();
+      const extracted = results?.[0]?.result || { title: tab.title || 'Без названия', text: '' };
+      const { title, text } = extracted;
 
-    getEl('summaryLoading').style.display = 'block';
-    const screenshotDataUrl = await getCompressedScreenshotDataUrl();
-    const inventory = await buildDomInventory(tab.id);
-    const inventorySummary = buildInventorySummary(inventory);
-    let responseText;
-    try {
-      const trimmedScreenshot = screenshotDataUrl && screenshotDataUrl.length > SCREENSHOT_MAX_CHARS
-        ? screenshotDataUrl.slice(0, SCREENSHOT_MAX_CHARS)
-        : screenshotDataUrl;
-      responseText = await sendQueryToModel(text, userQuery, isAgentMode, trimmedScreenshot, inventorySummary);
-    } catch (err) {
-      console.error('Query failed:', err);
-      responseText = 'Ошибка: ' + err.message;
-    }
-    getEl('summaryLoading').style.display = 'none';
+      await chrome.storage.session.set({
+        pageExtractedTitle: title,
+        pageExtractedText: text,
+        pageExtractedUrl: tab.url || ''
+      });
+      await loadPageFromStorage();
 
-    const titleSnippet = userQuery.slice(0, 50);
+      getEl('summaryLoading').style.display = 'block';
+      const screenshotDataUrl = await getCompressedScreenshotDataUrl();
+      const inventory = await buildDomInventory(tab.id);
+      const inventorySummary = buildInventorySummary(inventory);
+      let responseText;
+      try {
+        const trimmedScreenshot = screenshotDataUrl && screenshotDataUrl.length > SCREENSHOT_MAX_CHARS
+          ? screenshotDataUrl.slice(0, SCREENSHOT_MAX_CHARS)
+          : screenshotDataUrl;
+        responseText = await sendQueryToModel(text, currentQuery, isAgentMode, trimmedScreenshot, inventorySummary);
+      } catch (err) {
+        console.error('Query failed:', err);
+        responseText = 'Ошибка: ' + err.message;
+        isAgentRunning = false;
+      }
+      getEl('summaryLoading').style.display = 'none';
 
-    if (isPrivateMode) {
-      await appendPrivateMessage('user', userQuery);
-      await appendPrivateMessage('assistant', responseText);
-      const messages = await getPrivateMessages();
-      renderMessages(messages);
-    } else {
-      if (!currentChatId) currentChatId = createChatId();
-      await appendMessageToLocalChat(currentChatId, 'user', userQuery, titleSnippet);
-      await appendMessageToLocalChat(currentChatId, 'assistant', responseText);
-      const chats = await getChats();
-      renderMessages((chats[currentChatId] || {}).messages || []);
-      renderHistoryList();
-    }
+      const titleSnippet = userQuery.slice(0, 50);
 
-    if (isAgentMode) {
+      if (isPrivateMode) {
+        if (iteration === 1) await appendPrivateMessage('user', userQuery);
+        await appendPrivateMessage('assistant', responseText);
+        const messages = await getPrivateMessages();
+        renderMessages(messages);
+      } else {
+        if (!currentChatId) currentChatId = createChatId();
+        if (iteration === 1) await appendMessageToLocalChat(currentChatId, 'user', userQuery, titleSnippet);
+        await appendMessageToLocalChat(currentChatId, 'assistant', responseText);
+        const chats = await getChats();
+        renderMessages((chats[currentChatId] || {}).messages || []);
+        renderHistoryList();
+      }
+
+      if (!isAgentMode) {
+        break;
+      }
+
       const parsed = extractActionsFromResponse(responseText);
       if (parsed?.actions) {
+        const hasFinish = parsed.actions.some(a => a.type === 'finish');
+        
         const execResult = await runAgentActions(parsed.actions);
         const followup = `Результат выполнения действий:\n${execResult}`;
+        
         if (isPrivateMode) {
           await appendPrivateMessage('assistant', followup);
           const messages = await getPrivateMessages();
@@ -1016,8 +1064,18 @@ document.getElementById('sendBtn').addEventListener('click', async () => {
           renderMessages((chats[currentChatId] || {}).messages || []);
           renderHistoryList();
         }
+
+        if (hasFinish) {
+          isAgentRunning = false;
+          break;
+        }
+        
+        if (isAgentRunning) {
+          await sleep(2000);
+          currentQuery = `Оригинальный запрос пользователя: "${userQuery}"\n\nПродолжай выполнение задачи. Предыдущие действия выполнены. Если задача полностью завершена и ты видишь финальный результат на странице, используй действие finish. Если нет — продолжай выполнять нужные действия.`;
+        }
       } else {
-        const notice = 'Агент: действий не найдено или JSON нераспознан.';
+        const notice = 'Агент: действий не найдено или JSON нераспознан. Остановка.';
         if (isPrivateMode) {
           await appendPrivateMessage('assistant', notice);
           const messages = await getPrivateMessages();
@@ -1028,15 +1086,32 @@ document.getElementById('sendBtn').addEventListener('click', async () => {
           renderMessages((chats[currentChatId] || {}).messages || []);
           renderHistoryList();
         }
+        isAgentRunning = false;
+        break;
+      }
+    }
+    
+    if (iteration >= maxIterations) {
+      const notice = 'Достигнут лимит итераций агента.';
+      if (isPrivateMode) {
+        await appendPrivateMessage('assistant', notice);
+        renderMessages(await getPrivateMessages());
+      } else {
+        await appendMessageToLocalChat(currentChatId, 'assistant', notice);
+        const chats = await getChats();
+        renderMessages((chats[currentChatId] || {}).messages || []);
       }
     }
 
     queryInput.value = '';
   } catch (err) {
     getEl('summaryLoading').style.display = 'none';
+  } finally {
+    isAgentRunning = false;
+    getEl('stopAgentBtn').style.display = 'none';
+    btn.textContent = 'Отправить запрос';
+    btn.disabled = false;
   }
-  btn.textContent = 'Отправить запрос';
-  btn.disabled = false;
 });
 
 loadApiKey();
