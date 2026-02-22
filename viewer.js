@@ -7,6 +7,10 @@ const AGENT_MODE_KEY = 'proaibro_agent_mode';
 const SCREENSHOT_MAX_SIDE = 1024;
 const SCREENSHOT_JPEG_QUALITY = 0.6;
 const SCREENSHOT_MAX_CHARS = 120000; // защита от переполнения промпта
+const MAX_ACTIONS = 10;
+const INVENTORY_LIMIT = 120;
+const INVENTORY_TEXT_MAX = 12000;
+const INVENTORY_SUMMARY_LIMIT = 60;
 
 function getEl(id) {
   return document.getElementById(id);
@@ -135,7 +139,7 @@ async function appendPrivateMessage(role, content) {
   await chrome.storage.session.set({ [PRIVATE_CHAT_KEY]: messages });
 }
 
-async function sendQueryToModel(text, userQuery, agentMode, screenshotDataUrl) {
+async function sendQueryToModel(text, userQuery, agentMode, screenshotDataUrl, inventorySummary) {
   if (!apiKey) {
     await loadApiKey();
     if (!apiKey) throw new Error('API ключ не найден');
@@ -146,7 +150,7 @@ async function sendQueryToModel(text, userQuery, agentMode, screenshotDataUrl) {
   const screenshotInfo = hasScreenshot ? 'Скриншот приложен (JPEG data URL).' : 'Скриншот недоступен или не смог быть снят.';
   const textInfo = hasTextContent ? 'Текст страницы получен.' : 'Текст страницы отсутствует или пуст.';
 
-  const systemPrompt = `Ты помощник. Тебе даётся запрос пользователя, текст открытой страницы и (если есть) скриншот страницы.
+  const systemPrompt = `Ты помощник и агент. Тебе даётся запрос пользователя, текст открытой страницы и (если есть) скриншот страницы. Ты должен уметь визуально распознавать поля и кнопки на скриншоте и выполнять действия даже если селекторы неизвестны или отличаются от типовых. НЕ придумывай селекторы наугад — если не уверен, используй ocr_input/ocr_click и near.
 
 Правила ответа:
 1. Если ответ на запрос пользователя ЕСТЬ в тексте страницы или на скриншоте — опирайся на эти данные.
@@ -158,18 +162,26 @@ async function sendQueryToModel(text, userQuery, agentMode, screenshotDataUrl) {
 Если РЕЖИМ АГЕНТА ВКЛЮЧЕН: дай ДВА блока:
 — Краткий план действий (2–5 шагов)
 — JSON вида {"actions":[{"type":"input","selector":"CSS","value":"..."},{"type":"click","selector":"CSS"}]}
-   * Поддерживаемые type: "input" (ввод текста), "click" (клик мышью), "move" (подвести курсор к элементу для наведения/hover), "wait" (пауза в миллисекундах).
-   * Для input/click/move обязателен selector (CSS). Дай наиболее узкий селектор.
+   * Поддерживаемые type: "input" (ввод текста), "click" (клик мышью), "move" (прокрутка и подвод курсора), "wait" (пауза в мс), "press" (клавиши), "focus" (фокус), "select" (выбор в <select>), "ocr_input" (ввод в поле, найденное по тексту на скриншоте), "ocr_click" (клик по элементу/кнопке, найденным по тексту на скриншоте).
+   * Для input/click/move/focus/select обязателен selector (CSS). Можно указать несколько селекторов через "||" — пробуй слева направо. Для ocr_input/ocr_click селектор не обязателен, но можно добавить, если известен.
    * Для click можно указать button: "left" | "right" | "middle" (по умолчанию left).
    * Для wait укажи поле ms (0–4000).
-   * Не больше 10 действий. Если выполнить нельзя — actions: [].
+   * Для press укажи keys (например: "Enter", "Tab", "ArrowDown", "Escape").
+   * Для select укажи value ИЛИ label ИЛИ index.
+   * Для ocr_input: укажи text (что ввести) и near (ключевые слова/ярлыки поля, например: "Откуда", "From"), чтобы модель подобрала поле по скриншоту/DOM-инвентарю.
+   * Для ocr_click: укажи near (текст на кнопке/рядом), чтобы кликнуть по элементу, найденному по скриншоту/DOM-инвентарю.
+   * Не больше ${MAX_ACTIONS} действий. Если выполнить нельзя — actions: [].
+   * JSON должен быть валидным, без комментариев, и быть единственным JSON-блоком в формате \`\`\`json ... \`\`\`.
 
 Отвечай на русском языке.`;
+
+  const inventoryBlock = inventorySummary ? `\nDOM-инвентарь (ориентиры для near, не обязательно использовать селекторы):\n${inventorySummary}\n` : '';
 
   const userText = `Режим агента: ${agentMode ? 'ВКЛ' : 'ВЫКЛ'}
 Запрос пользователя: ${userQuery.trim()}
 ${textInfo}
 ${screenshotInfo}
+${inventoryBlock}
 
 Текст открытой страницы (если пустой — опирайся на скриншот или отвечай из знаний):
 ---
@@ -192,7 +204,7 @@ ${pageText}
       'X-Title': 'Proaibro'
     },
     body: JSON.stringify({
-      model: 'openai/gpt-4o-mini',
+      model: 'anthropic/claude-opus-4.6',
       messages: [
         { role: 'system', content: systemPrompt },
         userMessage
@@ -276,16 +288,22 @@ async function runAgentActions(actions) {
   if (!tab?.id) return 'Не удалось получить активную вкладку для агента.';
 
   const results = [];
-  for (const action of actions.slice(0, 10)) {
-    const { type, selector, value, button, ms } = action || {};
+  const inventory = await buildDomInventory(tab.id);
+
+  for (const action of actions.slice(0, MAX_ACTIONS)) {
+    const { type, selector, value, button, ms, keys, label, index, near, text, x, y } = action || {};
     const safeValue = value == null ? '' : String(value);
+    const safeText = text == null ? safeValue : String(text);
+    const safeNear = near == null ? '' : String(near);
     const safeButton = button || 'left';
+    const safeKeys = keys || '';
+
     if (!type) {
       results.push('Пропущено действие без type');
       continue;
     }
-    if ((type === 'click' || type === 'input' || type === 'move') && !selector) {
-      results.push(`Пропущено ${type} без selector`);
+    if ((type === 'click' || type === 'input' || type === 'move' || type === 'focus' || type === 'select') && !selector && !near && (x == null || y == null)) {
+      results.push(`Пропущено ${type} без selector, near или координат`);
       continue;
     }
 
@@ -299,30 +317,260 @@ async function runAgentActions(actions) {
     try {
       const [res] = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        args: [type, selector, safeValue, safeButton],
-        func: (aType, aSelector, aValue, aButton) => {
-          const el = aSelector ? document.querySelector(aSelector) : null;
-          if (aType === 'move') {
-            if (!el) return `Элемент не найден для move: ${aSelector}`;
-            el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'smooth' });
-            return `Навели курсор (scrollIntoView) на ${aSelector}`;
+        args: [
+          type,
+          selector || null,
+          safeValue,
+          safeButton,
+          safeKeys,
+          label || null,
+          index === undefined ? null : index,
+          safeNear,
+          safeText,
+          safeInventoryForArgs(inventory),
+          x === undefined ? null : x,
+          y === undefined ? null : y
+        ],
+        func: async (aType, aSelector, aValue, aButton, aKeys, aLabel, aIndex, aNear, aText, domInventory, aX, aY) => {
+          let targetEl = null;
+          if (aX != null && aY != null) {
+            targetEl = document.elementFromPoint(aX, aY);
           }
-          if (!el) return `Элемент не найден: ${aSelector}`;
-          if (aType === 'click') {
-            el.focus?.();
-            el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: aButton === 'right' ? 2 : aButton === 'middle' ? 1 : 0 }));
-            return `Клик (${aButton}) по ${aSelector}`;
-          }
-          if (aType === 'input') {
-            if ('value' in el) {
-              el.focus?.();
-              el.value = aValue ?? '';
-              el.dispatchEvent(new Event('input', { bubbles: true }));
-              el.dispatchEvent(new Event('change', { bubbles: true }));
-              return `Ввод в ${aSelector}: ${aValue}`;
+
+          const pickElement = (sel) => {
+            if (!sel) return null;
+            const parts = String(sel).split('||').map(s => s.trim()).filter(Boolean);
+            for (const p of parts) {
+              try {
+                if (p.startsWith('//') || p.startsWith('(/')) {
+                  const result = document.evaluate(p, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+                  if (result.singleNodeValue) return result.singleNodeValue;
+                } else {
+                  const found = document.querySelector(p);
+                  if (found) return found;
+                }
+              } catch (e) {
+                // ignore invalid selector
+              }
             }
-            return `Элемент не поддерживает value: ${aSelector}`;
+            return null;
+          };
+
+          const findByInventory = (nearText, role) => {
+            if (!nearText) return null;
+            const needle = nearText.toLowerCase();
+            
+            // 1. Try domInventory
+            const items = Array.isArray(domInventory) ? domInventory : [];
+            const candidates = items.filter(it => (role ? it.role === role : true) && it.text.toLowerCase().includes(needle));
+            if (candidates.length > 0) {
+              for (const target of candidates) {
+                try {
+                  const el = document.querySelector(target.selector);
+                  if (el) return el;
+                } catch(e) {}
+              }
+            }
+            
+            // 2. Fallback: search DOM for text
+            const allElements = Array.from(document.querySelectorAll(role === 'button' ? 'button, [role="button"], a' : 'input, textarea, select, [role="textbox"], [contenteditable="true"]'));
+            for (const el of allElements) {
+              let text = '';
+              if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+                text = el.placeholder || el.ariaLabel || el.name || el.id || '';
+                if (el.labels && el.labels.length > 0) {
+                  text += ' ' + Array.from(el.labels).map(l => l.innerText || l.textContent).join(' ');
+                } else if (el.id) {
+                  const label = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+                  if (label) text += ' ' + (label.innerText || label.textContent);
+                }
+                if (el.parentElement) {
+                  text += ' ' + (el.parentElement.innerText || el.parentElement.textContent);
+                }
+              } else {
+                text = el.innerText || el.textContent || el.ariaLabel || el.title || '';
+              }
+              if (text.toLowerCase().includes(needle)) {
+                return el;
+              }
+            }
+            
+            // 3. If still not found, find any element containing the text
+            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+            let node;
+            while (node = walker.nextNode()) {
+              if (node.nodeValue.toLowerCase().includes(needle)) {
+                let parent = node.parentElement;
+                if (role === 'button') {
+                  while (parent && parent !== document.body) {
+                    if (parent.tagName === 'BUTTON' || parent.tagName === 'A' || parent.getAttribute('role') === 'button' || parent.onclick) {
+                      return parent;
+                    }
+                    parent = parent.parentElement;
+                  }
+                } else if (role === 'input') {
+                  while (parent && parent !== document.body) {
+                    const input = parent.querySelector('input, textarea, select');
+                    if (input) return input;
+                    parent = parent.parentElement;
+                  }
+                }
+                return node.parentElement;
+              }
+            }
+            
+            return null;
+          };
+
+          if (!targetEl) {
+            const el = pickElement(aSelector);
+            const ocrEl = findByInventory(aNear, aType === 'ocr_click' ? 'button' : 'input');
+            targetEl = el || ocrEl;
           }
+
+          const moveFakeCursor = async (el, x, y) => {
+            let cursor = document.getElementById('proaibro-fake-cursor');
+            if (!cursor) {
+              cursor = document.createElement('div');
+              cursor.id = 'proaibro-fake-cursor';
+              cursor.style.position = 'fixed';
+              cursor.style.width = '30px';
+              cursor.style.height = '30px';
+              cursor.style.borderRadius = '50%';
+              cursor.style.backgroundColor = 'rgba(255, 0, 0, 0.8)';
+              cursor.style.border = '2px solid white';
+              cursor.style.boxShadow = '0 0 10px rgba(0,0,0,0.5)';
+              cursor.style.pointerEvents = 'none';
+              cursor.style.zIndex = '2147483647';
+              cursor.style.transition = 'all 1s ease-in-out';
+              
+              // Start from center of screen if new
+              cursor.style.left = `${window.innerWidth / 2}px`;
+              cursor.style.top = `${window.innerHeight / 2}px`;
+              document.body.appendChild(cursor);
+              
+              // Force reflow
+              cursor.getBoundingClientRect();
+            }
+            if (el) {
+              const rect = el.getBoundingClientRect();
+              x = rect.left + rect.width / 2;
+              y = rect.top + rect.height / 2;
+            }
+            if (x != null && y != null) {
+              cursor.style.left = `${x - 15}px`;
+              cursor.style.top = `${y - 15}px`;
+            }
+            
+            // Wait for transition to finish
+            await new Promise(r => setTimeout(r, 1000));
+            return { x, y };
+          };
+
+          if (aType === 'move') {
+            if (!targetEl && (aX == null || aY == null)) return `Элемент не найден для move: ${aSelector || aNear}`;
+            if (targetEl) targetEl.scrollIntoView({ block: 'center', inline: 'center', behavior: 'smooth' });
+            const coords = await moveFakeCursor(targetEl, aX, aY);
+            return `Навели курсор на ${aSelector || aNear || `[${aX},${aY}]`} [${Math.round(coords.x)},${Math.round(coords.y)}]`;
+          }
+
+          if (aType === 'focus') {
+            if (!targetEl) return `Элемент не найден для focus: ${aSelector || aNear}`;
+            targetEl.focus?.();
+            await moveFakeCursor(targetEl, aX, aY);
+            return `Фокус на ${aSelector || aNear}`;
+          }
+
+          if (aType === 'press') {
+            const key = aKeys || '';
+            const tgt = targetEl || document.activeElement || document.body;
+            if (!tgt) return 'Нет элемента для press';
+            const eventInit = { key, code: key, bubbles: true, cancelable: true };
+            tgt.dispatchEvent(new KeyboardEvent('keydown', eventInit));
+            tgt.dispatchEvent(new KeyboardEvent('keypress', eventInit));
+            tgt.dispatchEvent(new KeyboardEvent('keyup', eventInit));
+            return `Нажали клавишу ${key}`;
+          }
+
+          if (!targetEl) return `Элемент не найден: ${aSelector || aNear || `[${aX},${aY}]`}`;
+
+          if (aType === 'click' || aType === 'ocr_click') {
+            targetEl.focus?.();
+            const coords = await moveFakeCursor(targetEl, aX, aY);
+            
+            let cursor = document.getElementById('proaibro-fake-cursor');
+            if (cursor) {
+              cursor.style.backgroundColor = 'rgba(0, 255, 0, 0.8)';
+              cursor.style.transform = 'scale(0.8)';
+              setTimeout(() => {
+                cursor.style.backgroundColor = 'rgba(255, 0, 0, 0.8)';
+                cursor.style.transform = 'scale(1)';
+              }, 200);
+            }
+
+            const btn = aButton === 'right' ? 2 : aButton === 'middle' ? 1 : 0;
+            const eventInit = { bubbles: true, cancelable: true, clientX: coords.x, clientY: coords.y, button: btn };
+            targetEl.dispatchEvent(new MouseEvent('mousedown', eventInit));
+            targetEl.dispatchEvent(new MouseEvent('mouseup', eventInit));
+            targetEl.dispatchEvent(new MouseEvent('click', eventInit));
+            return `Клик (${aButton}) по ${aSelector || aNear || `[${aX},${aY}]`}`;
+          }
+
+          if (aType === 'input' || aType === 'ocr_input') {
+            if ('value' in targetEl || targetEl.isContentEditable) {
+              targetEl.focus?.();
+              await moveFakeCursor(targetEl, aX, aY);
+              
+              const textToType = aText || aValue || '';
+              
+              if (targetEl.isContentEditable) {
+                targetEl.innerText = textToType;
+              } else {
+                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+                const nativeTextAreaValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+                
+                if (targetEl instanceof HTMLInputElement && nativeInputValueSetter) {
+                  nativeInputValueSetter.call(targetEl, textToType);
+                } else if (targetEl instanceof HTMLTextAreaElement && nativeTextAreaValueSetter) {
+                  nativeTextAreaValueSetter.call(targetEl, textToType);
+                } else {
+                  targetEl.value = textToType;
+                }
+              }
+              
+              targetEl.dispatchEvent(new Event('input', { bubbles: true }));
+              targetEl.dispatchEvent(new Event('change', { bubbles: true }));
+              return `Ввод в ${aSelector || aNear || `[${aX},${aY}]`}: ${textToType}`;
+            }
+            return `Элемент не поддерживает value: ${aSelector || aNear || `[${aX},${aY}]`}`;
+          }
+
+          if (aType === 'select') {
+            if (!(targetEl instanceof HTMLSelectElement)) return `Элемент не <select>: ${aSelector || aNear}`;
+            const options = Array.from(targetEl.options || []);
+            let applied = false;
+            if (aValue != null) {
+              const v = String(aValue);
+              const found = options.find(o => o.value === v);
+              if (found) { targetEl.value = v; applied = true; }
+            }
+            if (!applied && aLabel != null) {
+              const lbl = String(aLabel).toLowerCase();
+              const found = options.find(o => (o.label || o.textContent || '').toLowerCase() === lbl);
+              if (found) { targetEl.value = found.value; applied = true; }
+            }
+            if (!applied && aIndex != null && !Number.isNaN(Number(aIndex))) {
+              const idx = Math.max(0, Math.min(options.length - 1, Number(aIndex)));
+              if (options[idx]) { targetEl.selectedIndex = idx; applied = true; }
+            }
+            if (applied) {
+              targetEl.dispatchEvent(new Event('input', { bubbles: true }));
+              targetEl.dispatchEvent(new Event('change', { bubbles: true }));
+              return `Выбрано в ${aSelector || aNear}`;
+            }
+            return `Не удалось выбрать опцию в ${aSelector || aNear}`;
+          }
+
           return `Неизвестный тип действия: ${aType}`;
         }
       });
@@ -332,6 +580,82 @@ async function runAgentActions(actions) {
     }
   }
   return results.join('\n');
+}
+
+async function buildDomInventory(tabId) {
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      args: [INVENTORY_LIMIT, INVENTORY_TEXT_MAX],
+      func: (limit, textMax) => {
+        const items = [];
+        const nodes = Array.from(document.querySelectorAll('input, textarea, button, select, [role="button"], [role="textbox"], [contenteditable="true"]'));
+        for (const el of nodes.slice(0, limit)) {
+          let text = '';
+          if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+            text = el.placeholder || '';
+            if (!text) text = el.ariaLabel || '';
+            if (!text && el.labels && el.labels.length > 0) {
+              text = Array.from(el.labels).map(l => l.innerText || l.textContent).join(' ');
+            } else if (!text && el.id) {
+              try {
+                const label = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+                if (label) text = label.innerText || label.textContent;
+              } catch(e) {}
+            }
+          } else {
+            text = el.innerText || el.textContent || '';
+          }
+          text = (text || '').trim();
+          if (text.length > textMax) text = text.slice(0, textMax);
+
+          const role = el instanceof HTMLButtonElement || el.getAttribute('role') === 'button' ? 'button'
+            : (el instanceof HTMLSelectElement ? 'select'
+            : (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el.getAttribute('role') === 'textbox' || el.isContentEditable ? 'input' : 'other'));
+
+          items.push({
+            selector: getUniqueSelector(el),
+            text,
+            tag: el.tagName.toLowerCase(),
+            role
+          });
+        }
+        return items;
+
+        function getUniqueSelector(el) {
+          if (el.id) return `#${CSS.escape(el.id)}`;
+          const name = el.getAttribute('name');
+          if (name) return `${el.tagName.toLowerCase()}[name="${CSS.escape(name)}"]`;
+          const aria = el.getAttribute('aria-label');
+          if (aria) return `${el.tagName.toLowerCase()}[aria-label="${CSS.escape(aria)}"]`;
+          const classes = (el.className || '').split(/\s+/).filter(Boolean).slice(0, 3).map(c => `.${CSS.escape(c)}`).join('');
+          const tag = el.tagName.toLowerCase();
+          return classes ? `${tag}${classes}` : tag;
+        }
+      }
+    });
+    if (res?.result && Array.isArray(res.result)) return res.result;
+  } catch (err) {
+    console.warn('buildDomInventory failed', err);
+  }
+  return [];
+}
+
+function safeInventoryForArgs(inventory) {
+  try {
+    const sliced = Array.isArray(inventory) ? inventory.slice(0, INVENTORY_SUMMARY_LIMIT) : [];
+    return JSON.parse(JSON.stringify(sliced));
+  } catch (_) {
+    return [];
+  }
+}
+
+function buildInventorySummary(inventory) {
+  const list = Array.isArray(inventory) ? inventory : [];
+  return list.slice(0, INVENTORY_SUMMARY_LIMIT).map((item, idx) => {
+    const text = (item.text || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+    return `${idx + 1}. [${item.role}] ${item.tag} ${item.selector} :: ${text || '—'}`;
+  }).join('\n');
 }
 
 async function loadChat(chatId) {
@@ -549,12 +873,14 @@ document.getElementById('sendBtn').addEventListener('click', async () => {
 
     getEl('summaryLoading').style.display = 'block';
     const screenshotDataUrl = await getCompressedScreenshotDataUrl();
+    const inventory = await buildDomInventory(tab.id);
+    const inventorySummary = buildInventorySummary(inventory);
     let responseText;
     try {
       const trimmedScreenshot = screenshotDataUrl && screenshotDataUrl.length > SCREENSHOT_MAX_CHARS
         ? screenshotDataUrl.slice(0, SCREENSHOT_MAX_CHARS)
         : screenshotDataUrl;
-      responseText = await sendQueryToModel(text, userQuery, isAgentMode, trimmedScreenshot);
+      responseText = await sendQueryToModel(text, userQuery, isAgentMode, trimmedScreenshot, inventorySummary);
     } catch (err) {
       console.error('Query failed:', err);
       responseText = 'Ошибка: ' + err.message;
