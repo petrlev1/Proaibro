@@ -8,9 +8,12 @@ const SCREENSHOT_MAX_SIDE = 1024;
 const SCREENSHOT_JPEG_QUALITY = 0.6;
 const SCREENSHOT_MAX_CHARS = 120000; // защита от переполнения промпта
 const MAX_ACTIONS = 10;
+const MAX_AGENT_ITERATIONS = 3; // максимальное количество итераций агента
 const INVENTORY_LIMIT = 120;
 const INVENTORY_TEXT_MAX = 12000;
 const INVENTORY_SUMMARY_LIMIT = 60;
+const ACTION_RETRY_COUNT = 2; // количество повторных попыток для действий
+const ALLOWED_DOMAINS = ['*']; // whitelist доменов, '*' для всех
 
 function getEl(id) {
   return document.getElementById(id);
@@ -21,6 +24,10 @@ let currentChatId = null;
 let isPrivateMode = false;
 let isAgentMode = false;
 let abortController = null;
+let agentIteration = 0; // текущая итерация агента
+let agentActionHistory = []; // история действий агента
+let lastInventory = null; // кэш последнего инвентаря
+let lastScreenshotHash = null; // хэш последнего скриншота для кэширования
 
 async function loadApiKey() {
   try {
@@ -140,7 +147,7 @@ async function appendPrivateMessage(role, content) {
   await chrome.storage.session.set({ [PRIVATE_CHAT_KEY]: messages });
 }
 
-async function sendQueryToModel(text, userQuery, agentMode, screenshotDataUrl, inventorySummary) {
+async function sendQueryToModel(text, userQuery, agentMode, screenshotDataUrl, inventorySummary, actionHistory = []) {
   if (!apiKey) {
     await loadApiKey();
     if (!apiKey) throw new Error('API ключ не найден');
@@ -153,42 +160,58 @@ async function sendQueryToModel(text, userQuery, agentMode, screenshotDataUrl, i
 
   const systemPrompt = `Ты помощник и агент. Тебе даётся запрос пользователя, текст открытой страницы и (если есть) скриншот страницы. Ты должен уметь визуально распознавать поля и кнопки на скриншоте и выполнять действия даже если селекторы неизвестны или отличаются от типовых. НЕ придумывай селекторы наугад — если не уверен, используй ocr_input/ocr_click и near.
 
-Правила ответа:
-1. Если ответ на запрос пользователя ЕСТЬ в тексте страницы или на скриншоте — опирайся на эти данные.
-2. Если нужной информации нет или её недостаточно — ответь из своих знаний.
-3. Если текста нет, опирайся только на скриншот. Если нет ни текста, ни скриншота — отвечай из общих знаний.
+ Правила ответа:
+ 1. Если ответ на запрос пользователя ЕСТЬ в тексте страницы или на скриншоте — опирайся на эти данные.
+ 2. Если нужной информации нет или её недостаточно — ответь из своих знаний.
+ 3. Если текста нет, опирайся только на скриншот. Если нет ни текста, ни скриншота — отвечай из общих знаний.
 
-Если РЕЖИМ АГЕНТА ВЫКЛЮЧЕН: дай только текстовый ответ.
+ Если РЕЖИМ АГЕНТА ВЫКЛЮЧЕН: дай только текстовый ответ.
 
-Если РЕЖИМ АГЕНТА ВКЛЮЧЕН: дай ДВА блока:
-— Краткий план действий (2–5 шагов)
-— JSON вида {"actions":[{"type":"input","selector":"CSS","value":"..."},{"type":"click","selector":"CSS"}]}
-   * Поддерживаемые type: "input" (ввод текста), "click" (клик мышью), "move" (прокрутка и подвод курсора), "wait" (пауза в мс), "press" (клавиши), "focus" (фокус), "select" (выбор в <select>), "ocr_input" (ввод в поле, найденное по тексту на скриншоте), "ocr_click" (клик по элементу/кнопке, найденным по тексту на скриншоте).
-   * Для input/click/move/focus/select обязателен selector (CSS) ИЛИ точные координаты x и y (если можешь определить их по скриншоту). Можно указать несколько селекторов через "||" — пробуй слева направо. Для ocr_input/ocr_click селектор не обязателен, но можно добавить, если известен.
-   * Для click можно указать button: "left" | "right" | "middle" (по умолчанию left).
-   * Для wait укажи поле ms (0–4000).
-   * Для press укажи keys (например: "Enter", "Tab", "ArrowDown", "Escape").
-   * Для select укажи value ИЛИ label ИЛИ index.
-   * Для ocr_input: укажи text (что ввести) и near (ключевые слова/ярлыки поля, например: "Откуда", "From"), чтобы модель подобрала поле по скриншоту/DOM-инвентарю.
-   * Для ocr_click: укажи near (текст на кнопке/рядом), чтобы кликнуть по элементу, найденному по скриншоту/DOM-инвентарю.
-   * Если ты видишь элемент на скриншоте, но не знаешь его селектор, ты можешь передать точные координаты x и y (в пикселях от левого верхнего угла страницы) для любого действия (click, input, move).
-   * Не больше ${MAX_ACTIONS} действий. Если выполнить нельзя — actions: [].
-   * JSON должен быть валидным, без комментариев, и быть единственным JSON-блоком в формате \`\`\`json ... \`\`\`.
+ Если РЕЖИМ АГЕНТА ВКЛЮЧЕН: дай ДВА блока:
+ — Краткий план действий (2–5 шагов)
+ — JSON вида {"actions":[{"type":"input","selector":"CSS","value":"..."},{"type":"click","selector":"CSS"}]}
+    * Поддерживаемые type: "input" (ввод текста), "click" (клик мышью), "move" (прокрутка и подвод курсора), "wait" (пауза в мс), "press" (клавиши), "focus" (фокус), "select" (выбор в <select>), "scroll" (прокрутка), "hover" (наведение), "drag_and_drop" (перетаскивание), "upload_file" (загрузка файла), "read_text" (чтение текста), "assert" (проверка), "ocr_input" (ввод в поле, найденное по тексту на скриншоте), "ocr_click" (клик по элементу/кнопке, найденным по тексту на скриншоте).
+    * Для input/click/move/focus/select/scroll/hover/drag_and_drop/upload_file/assert/read_text обязателен selector (CSS) ИЛИ точные координаты x и y (если можешь определить их по скриншоту). Можно указать несколько селекторов через "||" — пробуй слева направо. Для ocr_input/ocr_click селектор не обязателен, но можно добавить, если известен.
+    * Для click можно указать button: "left" | "right" | "middle" (по умолчанию left).
+    * Для wait укажи поле ms (0–4000).
+    * Для press укажи keys (например: "Enter", "Tab", "ArrowDown", "Escape").
+    * Для select укажи value ИЛИ label ИЛИ index.
+    * Для scroll укажи direction: "up" | "down" | "left" | "right" ИЛИ amount (пиксели) ИЛИ selector элемента для прокрутки к нему.
+    * Для hover укажи selector или near или координаты.
+    * Для drag_and_drop укажи from (selector/координаты) и to (selector/координаты).
+    * Для upload_file укажи selector и filePath (путь к файлу).
+    * Для read_text укажи selector или near, результат будет добавлен в контекст.
+    * Для assert укажи type: "text_visible" | "element_visible" | "element_not_visible" | "url_contains" и value для проверки.
+    * Для ocr_input: укажи text (что ввести) и near (ключевые слова/ярлыки поля, например: "Откуда", "From"), чтобы модель подобрала поле по скриншоту/DOM-инвентарю.
+    * Для ocr_click: укажи near (текст на кнопке/рядом), чтобы кликнуть по элементу, найденному по скриншоту/DOM-инвентарю.
+    * Если ты видишь элемент на скриншоте, но не знаешь его селектор, ты можешь передать точные координаты x и y (в пикселях от левого верхнего угла страницы) для любого действия (click, input, move).
+    * Не больше ${MAX_ACTIONS} действий. Если выполнить нельзя — actions: [].
+    * JSON должен быть валидным, без комментариев, и быть единственным JSON-блоком в формате \`\`\`json ... \`\`\`.
 
-Отвечай на русском языке.`;
+ ВАЖНЫЕ ИНСТРУКЦИИ ПО ОБРАБОТКЕ ОШИБОК:
+ - Если элемент не найден по селектору: попробуй альтернативный селектор через ||, затем используй ocr_click/ocr_input с near, затем верни actions: [] и объясни проблему.
+ - Всегда проверяй, что элемент видим и доступен перед действием.
+ - Если действие не удалось, попробуй альтернативный подход в следующей итерации.
+ - Не повторяй одни и те же действия без изменений.
+
+ Отвечай на русском языке.`;
 
   const inventoryBlock = inventorySummary ? `\nDOM-инвентарь (ориентиры для near, не обязательно использовать селекторы):\n${inventorySummary}\n` : '';
+  const historyBlock = actionHistory.length > 0
+    ? `\nИстория выполненных действий:\n${actionHistory.map((h, i) => `${i + 1}. ${h}`).join('\n')}\n`
+    : '';
 
   const userText = `Режим агента: ${agentMode ? 'ВКЛ' : 'ВЫКЛ'}
-Запрос пользователя: ${userQuery.trim()}
-${textInfo}
-${screenshotInfo}
-${inventoryBlock}
+ Запрос пользователя: ${userQuery.trim()}
+ ${textInfo}
+ ${screenshotInfo}
+ ${inventoryBlock}
+ ${historyBlock}
 
-Текст открытой страницы (если пустой — опирайся на скриншот или отвечай из знаний):
----
-${pageText}
----`;
+ Текст открытой страницы (если пустой — опирайся на скриншот или отвечай из знаний):
+ ---
+ ${pageText}
+ ---`;
 
   const userMessage = screenshotDataUrl
     ? { role: 'user', content: [
@@ -292,22 +315,35 @@ async function runAgentActions(actions) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) return 'Не удалось получить активную вкладку для агента.';
 
+  // Проверка домена
+  const url = new URL(tab.url);
+  if (!ALLOWED_DOMAINS.includes('*') && !ALLOWED_DOMAINS.includes(url.hostname)) {
+    return `Действия агента запрещены для домена ${url.hostname}. Разрешённые домены: ${ALLOWED_DOMAINS.join(', ')}`;
+  }
+
   const results = [];
   const inventory = await buildDomInventory(tab.id);
 
   for (const action of actions.slice(0, MAX_ACTIONS)) {
-    const { type, selector, value, button, ms, keys, label, index, near, text, x, y } = action || {};
+    const { type, selector, value, button, ms, keys, label, index, near, text, x, y, direction, amount, from, to, filePath, assertType } = action || {};
     const safeValue = value == null ? '' : String(value);
     const safeText = text == null ? safeValue : String(text);
     const safeNear = near == null ? '' : String(near);
     const safeButton = button || 'left';
     const safeKeys = keys || '';
+    const safeDirection = direction || 'down';
+    const safeAmount = amount == null ? 200 : Number(amount);
+    const safeFilePath = filePath || '';
+    const safeAssertType = assertType || 'text_visible';
 
     if (!type) {
       results.push('Пропущено действие без type');
       continue;
     }
-    if ((type === 'click' || type === 'input' || type === 'move' || type === 'focus' || type === 'select') && !selector && !near && (x == null || y == null)) {
+    
+    // Проверка обязательных параметров для разных типов действий
+    const requiresSelectorOrCoords = ['click', 'input', 'move', 'focus', 'select', 'scroll', 'hover', 'drag_and_drop', 'upload_file', 'read_text', 'assert'];
+    if (requiresSelectorOrCoords.includes(type) && !selector && !near && (x == null || y == null)) {
       results.push(`Пропущено ${type} без selector, near или координат`);
       continue;
     }
@@ -316,70 +352,16 @@ async function runAgentActions(actions) {
       const dur = Math.min(Math.max(Number(ms) || 0, 0), 4000);
       await sleep(dur);
       results.push(`Ожидание ${dur} мс`);
+      agentActionHistory.push(`Ожидание ${dur} мс`);
       continue;
     }
 
-    try {
-      const resultsArr = await chrome.scripting.executeScript({
-        target: { tabId: tab.id, allFrames: true },
-        args: [
-          type,
-          selector || null,
-          safeValue,
-          safeButton,
-          safeKeys,
-          label || null,
-          index === undefined ? null : index,
-          safeNear,
-          safeText,
-          safeInventoryForArgs(inventory),
-          x === undefined ? null : x,
-          y === undefined ? null : y
-        ],
-        func: async (aType, aSelector, aValue, aButton, aKeys, aLabel, aIndex, aNear, aText, domInventory, aX, aY) => {
-          let targetEl = null;
-          if (aX != null && aY != null) {
-            targetEl = document.elementFromPoint(aX, aY);
-          }
-
-          const pickElement = (sel) => {
-            if (!sel) return null;
-            const parts = String(sel).split('||').map(s => s.trim()).filter(Boolean);
-            for (const p of parts) {
-              try {
-                if (p.startsWith('//') || p.startsWith('(/')) {
-                  const result = document.evaluate(p, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-                  if (result.singleNodeValue) return result.singleNodeValue;
-                } else {
-                  const querySelectorDeep = (selector, root = document) => {
-                    const el = root.querySelector(selector);
-                    if (el) return el;
-                    const elements = root.querySelectorAll('*');
-                    for (const e of elements) {
-                      if (e.shadowRoot) {
-                        const found = querySelectorDeep(selector, e.shadowRoot);
-                        if (found) return found;
-                      }
-                    }
-                    return null;
-                  };
-                  const found = querySelectorDeep(p);
-                  if (found) return found;
-                }
-              } catch (e) {
-                // ignore invalid selector
-              }
-            }
-            return null;
-          };
-
-          const findByInventory = (nearText, role) => {
-            if (!nearText) return null;
-            const needle = nearText.toLowerCase();
-            
-            // 1. Try domInventory
-            const items = Array.isArray(domInventory) ? domInventory : [];
-            const candidates = items.filter(it => (role ? it.role === role : true) && it.text.toLowerCase().includes(needle));
+    if (type === 'assert') {
+      try {
+        const assertResult = await chrome.scripting.executeScript({
+          target: { tabId: tab.id, allFrames: true },
+          args: [safeAssertType, safeValue, selector || null, safeNear],
+          func: (aType, aValue, aSelector, aNear) => {
             const querySelectorDeep = (selector, root = document) => {
               const el = root.querySelector(selector);
               if (el) return el;
@@ -393,280 +375,498 @@ async function runAgentActions(actions) {
               return null;
             };
 
-            if (candidates.length > 0) {
-              for (const target of candidates) {
-                try {
-                  const el = querySelectorDeep(target.selector);
-                  if (el) return el;
-                } catch(e) {}
+            if (aType === 'text_visible') {
+              return document.body.innerText.includes(aValue);
+            } else if (aType === 'element_visible') {
+              const el = aSelector ? querySelectorDeep(aSelector) : null;
+              if (el) {
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0 && rect.top >= 0;
               }
+              return false;
+            } else if (aType === 'element_not_visible') {
+              const el = aSelector ? querySelectorDeep(aSelector) : null;
+              if (!el) return true;
+              const rect = el.getBoundingClientRect();
+              return !(rect.width > 0 && rect.height > 0 && rect.top >= 0);
+            } else if (aType === 'url_contains') {
+              return window.location.href.includes(aValue);
             }
-            
-            const querySelectorAllDeep = (selector, root = document) => {
-              const result = [];
-              const elements = root.querySelectorAll('*');
-              for (const el of elements) {
-                if (el.matches && el.matches(selector)) result.push(el);
-                if (el.shadowRoot) result.push(...querySelectorAllDeep(selector, el.shadowRoot));
+            return false;
+          }
+        });
+        
+        const success = assertResult?.[0]?.result === true;
+        const msg = success ? `Проверка успешна: ${safeAssertType} "${safeValue}"` : `Проверка не пройдена: ${safeAssertType} "${safeValue}"`;
+        results.push(msg);
+        agentActionHistory.push(msg);
+        if (!success) break; // Прерываем выполнение при неудачной проверке
+        continue;
+      } catch (err) {
+        results.push(`Ошибка проверки: ${err.message}`);
+        continue;
+      }
+    }
+
+    // Повторные попытки для действий
+    let lastError = null;
+    for (let retry = 0; retry <= ACTION_RETRY_COUNT; retry++) {
+      try {
+        const resultsArr = await chrome.scripting.executeScript({
+          target: { tabId: tab.id, allFrames: true },
+          args: [
+            type,
+            selector || null,
+            safeValue,
+            safeButton,
+            safeKeys,
+            label || null,
+            index === undefined ? null : index,
+            safeNear,
+            safeText,
+            safeInventoryForArgs(inventory),
+            x === undefined ? null : x,
+            y === undefined ? null : y,
+            safeDirection,
+            safeAmount,
+            from || null,
+            to || null,
+            safeFilePath
+          ],
+          func: async (aType, aSelector, aValue, aButton, aKeys, aLabel, aIndex, aNear, aText, domInventory, aX, aY, aDirection, aAmount, aFrom, aTo, aFilePath) => {
+            let targetEl = null;
+            if (aX != null && aY != null) {
+              targetEl = document.elementFromPoint(aX, aY);
+            }
+
+            const pickElement = (sel) => {
+              if (!sel) return null;
+              const parts = String(sel).split('||').map(s => s.trim()).filter(Boolean);
+              for (const p of parts) {
+                try {
+                  if (p.startsWith('//') || p.startsWith('(/')) {
+                    const result = document.evaluate(p, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+                    if (result.singleNodeValue) return result.singleNodeValue;
+                  } else {
+                    const querySelectorDeep = (selector, root = document) => {
+                      const el = root.querySelector(selector);
+                      if (el) return el;
+                      const elements = root.querySelectorAll('*');
+                      for (const e of elements) {
+                        if (e.shadowRoot) {
+                          const found = querySelectorDeep(selector, e.shadowRoot);
+                          if (found) return found;
+                        }
+                      }
+                      return null;
+                    };
+                    const found = querySelectorDeep(p);
+                    if (found) return found;
+                  }
+                } catch (e) {
+                  // ignore invalid selector
+                }
               }
-              return result;
+              return null;
             };
 
-            // 2. Fallback: search DOM for text
-            const allElements = querySelectorAllDeep(role === 'button' ? 'button, [role="button"], a' : 'input, textarea, select, [role="textbox"], [contenteditable="true"]');
-            for (const el of allElements) {
-              let text = '';
-              if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
-                text = el.placeholder || el.ariaLabel || el.name || el.id || '';
-                if (el.labels && el.labels.length > 0) {
-                  text += ' ' + Array.from(el.labels).map(l => l.innerText || l.textContent).join(' ');
-                } else if (el.id) {
-                  const root = el.getRootNode();
-                  const label = root.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-                  if (label) text += ' ' + (label.innerText || label.textContent);
-                }
-                if (el.parentElement) {
-                  text += ' ' + (el.parentElement.innerText || el.parentElement.textContent);
-                }
-              } else {
-                text = el.innerText || el.textContent || el.ariaLabel || el.title || '';
-              }
-              if (text.toLowerCase().includes(needle)) {
-                return el;
-              }
-            }
-            
-            // 3. If still not found, find any element containing the text
-            const searchInShadowDOM = (root, needle) => {
-              const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
-              let node;
-              while (node = walker.nextNode()) {
-                if (node.nodeValue.toLowerCase().includes(needle)) return node;
-              }
+            const findByInventory = (nearText, role) => {
+              if (!nearText) return null;
+              const needle = nearText.toLowerCase();
+              
+              // 1. Try domInventory
+              const items = Array.isArray(domInventory) ? domInventory : [];
+              const candidates = items.filter(it => (role ? it.role === role : true) && it.text.toLowerCase().includes(needle));
+            const querySelectorDeep = (selector, root = document) => {
+              const el = root.querySelector(selector);
+              if (el) return el;
               const elements = root.querySelectorAll('*');
-              for (const el of elements) {
-                if (el.shadowRoot) {
-                  const found = searchInShadowDOM(el.shadowRoot, needle);
+              for (const e of elements) {
+                if (e.shadowRoot) {
+                  const found = querySelectorDeep(selector, e.shadowRoot);
                   if (found) return found;
                 }
               }
               return null;
             };
 
-            const node = searchInShadowDOM(document.body, needle);
-            if (node) {
-              let parent = node.parentElement;
-                if (role === 'button') {
-                  while (parent && parent !== document.body) {
-                    if (parent.tagName === 'BUTTON' || parent.tagName === 'A' || parent.getAttribute('role') === 'button' || parent.onclick) {
-                      return parent;
-                    }
-                    parent = parent.parentElement;
+              if (candidates.length > 0) {
+                for (const target of candidates) {
+                  try {
+                    const el = querySelectorDeep(target.selector);
+                    if (el) return el;
+                  } catch(e) {}
+                }
+              }
+              
+              const querySelectorAllDeep = (selector, root = document) => {
+                const result = [];
+                const elements = root.querySelectorAll('*');
+                for (const el of elements) {
+                  if (el.matches && el.matches(selector)) result.push(el);
+                  if (el.shadowRoot) result.push(...querySelectorAllDeep(selector, el.shadowRoot));
+                }
+                return result;
+              };
+
+              // 2. Fallback: search DOM for text
+              const allElements = querySelectorAllDeep(role === 'button' ? 'button, [role="button"], a' : 'input, textarea, select, [role="textbox"], [contenteditable="true"]');
+              for (const el of allElements) {
+                let text = '';
+                if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+                  text = el.placeholder || el.ariaLabel || el.name || el.id || '';
+                  if (el.labels && el.labels.length > 0) {
+                    text += ' ' + Array.from(el.labels).map(l => l.innerText || l.textContent).join(' ');
+                  } else if (el.id) {
+                    const root = el.getRootNode();
+                    const label = root.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+                    if (label) text += ' ' + (label.innerText || label.textContent);
                   }
-                } else if (role === 'input') {
-                  let p = parent;
-                  while (p && p !== document.body) {
-                    const input = p.querySelector('input, textarea, select, [contenteditable="true"]');
-                    if (input) return input;
-                    p = p.parentElement;
+                  if (el.parentElement) {
+                    text += ' ' + (el.parentElement.innerText || el.parentElement.textContent);
                   }
-                  p = parent;
-                  while (p && p !== document.body) {
-                    let sibling = p.nextElementSibling;
-                    while (sibling) {
-                      const input = sibling.matches('input, textarea, select, [contenteditable="true"]') ? sibling : sibling.querySelector('input, textarea, select, [contenteditable="true"]');
-                      if (input) return input;
-                      sibling = sibling.nextElementSibling;
-                    }
-                    p = p.parentElement;
+                } else {
+                  text = el.innerText || el.textContent || el.ariaLabel || el.title || '';
+                }
+                if (text.toLowerCase().includes(needle)) {
+                  return el;
+                }
+              }
+              
+              // 3. If still not found, find any element containing the text
+              const searchInShadowDOM = (root, needle) => {
+                const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
+                let node;
+                while (node = walker.nextNode()) {
+                  if (node.nodeValue.toLowerCase().includes(needle)) return node;
+                }
+                const elements = root.querySelectorAll('*');
+                for (const el of elements) {
+                  if (el.shadowRoot) {
+                    const found = searchInShadowDOM(el.shadowRoot, needle);
+                    if (found) return found;
                   }
                 }
-                return node.parentElement;
-            }
-            
-            return null;
-          };
+                return null;
+              };
 
-          if (!targetEl) {
-            const el = pickElement(aSelector);
-            const ocrEl = findByInventory(aNear, aType === 'ocr_click' ? 'button' : 'input');
-            targetEl = el || ocrEl;
-          }
-
-          const moveFakeCursor = async (el, x, y) => {
-            let cursor = document.getElementById('proaibro-fake-cursor');
-            if (!cursor) {
-              cursor = document.createElement('div');
-              cursor.id = 'proaibro-fake-cursor';
-              cursor.style.position = 'fixed';
-              cursor.style.width = '30px';
-              cursor.style.height = '30px';
-              cursor.style.borderRadius = '50%';
-              cursor.style.backgroundColor = 'rgba(255, 0, 0, 0.8)';
-              cursor.style.border = '2px solid white';
-              cursor.style.boxShadow = '0 0 10px rgba(0,0,0,0.5)';
-              cursor.style.pointerEvents = 'none';
-              cursor.style.zIndex = '2147483647';
-              cursor.style.transition = 'all 1s ease-in-out';
-              
-              // Start from center of screen if new
-              cursor.style.left = `${window.innerWidth / 2}px`;
-              cursor.style.top = `${window.innerHeight / 2}px`;
-              document.body.appendChild(cursor);
-              
-              // Force reflow
-              cursor.getBoundingClientRect();
-            }
-            if (el) {
-              const rect = el.getBoundingClientRect();
-              x = rect.left + rect.width / 2;
-              y = rect.top + rect.height / 2;
-            }
-            if (x != null && y != null) {
-              cursor.style.left = `${x - 15}px`;
-              cursor.style.top = `${y - 15}px`;
-            }
-            
-            // Wait for transition to finish
-            await new Promise(r => setTimeout(r, 1000));
-            return { x, y };
-          };
-
-          if (aType === 'move') {
-            if (!targetEl && (aX == null || aY == null)) return `Элемент не найден для move: ${aSelector || aNear}`;
-            if (targetEl) targetEl.scrollIntoView({ block: 'center', inline: 'center', behavior: 'smooth' });
-            const coords = await moveFakeCursor(targetEl, aX, aY);
-            return `Навели курсор на ${aSelector || aNear || `[${aX},${aY}]`} [${Math.round(coords.x)},${Math.round(coords.y)}]`;
-          }
-
-          if (aType === 'focus') {
-            if (!targetEl) return `Элемент не найден для focus: ${aSelector || aNear}`;
-            targetEl.focus?.();
-            await moveFakeCursor(targetEl, aX, aY);
-            return `Фокус на ${aSelector || aNear}`;
-          }
-
-          if (aType === 'press') {
-            const key = aKeys || '';
-            const tgt = targetEl || document.activeElement || document.body;
-            if (!tgt) return 'Нет элемента для press';
-            const eventInit = { key, code: key, bubbles: true, cancelable: true, composed: true, view: window };
-            tgt.dispatchEvent(new KeyboardEvent('keydown', eventInit));
-            tgt.dispatchEvent(new KeyboardEvent('keypress', eventInit));
-            tgt.dispatchEvent(new KeyboardEvent('keyup', eventInit));
-            return `Нажали клавишу ${key}`;
-          }
-
-          if (!targetEl) return `Элемент не найден: ${aSelector || aNear || `[${aX},${aY}]`}`;
-
-          if (aType === 'click' || aType === 'ocr_click') {
-            targetEl.focus?.();
-            const coords = await moveFakeCursor(targetEl, aX, aY);
-            
-            let cursor = document.getElementById('proaibro-fake-cursor');
-            if (cursor) {
-              cursor.style.backgroundColor = 'rgba(0, 255, 0, 0.8)';
-              cursor.style.transform = 'scale(0.8)';
-              setTimeout(() => {
-                cursor.style.backgroundColor = 'rgba(255, 0, 0, 0.8)';
-                cursor.style.transform = 'scale(1)';
-              }, 200);
-            }
-
-            const btn = aButton === 'right' ? 2 : aButton === 'middle' ? 1 : 0;
-            const eventInit = { bubbles: true, cancelable: true, composed: true, view: window, clientX: coords.x, clientY: coords.y, button: btn, pointerId: 1, pointerType: 'mouse', isPrimary: true };
-            targetEl.dispatchEvent(new PointerEvent('pointerdown', eventInit));
-            targetEl.dispatchEvent(new MouseEvent('mousedown', eventInit));
-            targetEl.dispatchEvent(new PointerEvent('pointerup', eventInit));
-            targetEl.dispatchEvent(new MouseEvent('mouseup', eventInit));
-            targetEl.dispatchEvent(new MouseEvent('click', eventInit));
-            return `Клик (${aButton}) по ${aSelector || aNear || `[${aX},${aY}]`}`;
-          }
-
-          if (aType === 'input' || aType === 'ocr_input') {
-            if (!('value' in targetEl) && !targetEl.isContentEditable) {
-              if (document.activeElement && ('value' in document.activeElement || document.activeElement.isContentEditable)) {
-                targetEl = document.activeElement;
+              const node = searchInShadowDOM(document.body, needle);
+              if (node) {
+                let parent = node.parentElement;
+                  if (role === 'button') {
+                    while (parent && parent !== document.body) {
+                      if (parent.tagName === 'BUTTON' || parent.tagName === 'A' || parent.getAttribute('role') === 'button' || parent.onclick) {
+                        return parent;
+                      }
+                      parent = parent.parentElement;
+                    }
+                  } else if (role === 'input') {
+                    let p = parent;
+                    while (p && p !== document.body) {
+                      const input = p.querySelector('input, textarea, select, [contenteditable="true"]');
+                      if (input) return input;
+                      p = p.parentElement;
+                    }
+                    p = parent;
+                    while (p && p !== document.body) {
+                      let sibling = p.nextElementSibling;
+                      while (sibling) {
+                        const input = sibling.matches('input, textarea, select, [contenteditable="true"]') ? sibling : sibling.querySelector('input, textarea, select, [contenteditable="true"]');
+                        if (input) return input;
+                        sibling = sibling.nextElementSibling;
+                      }
+                      p = p.parentElement;
+                    }
+                  }
+                  return node.parentElement;
               }
+              
+              return null;
+            };
+
+            if (!targetEl) {
+              const el = pickElement(aSelector);
+              const ocrEl = findByInventory(aNear, aType === 'ocr_click' ? 'button' : 'input');
+              targetEl = el || ocrEl;
             }
-            
-            if ('value' in targetEl || targetEl.isContentEditable) {
+
+            const moveFakeCursor = async (el, x, y) => {
+              let cursor = document.getElementById('proaibro-fake-cursor');
+              if (!cursor) {
+                cursor = document.createElement('div');
+                cursor.id = 'proaibro-fake-cursor';
+                cursor.style.position = 'fixed';
+                cursor.style.width = '30px';
+                cursor.style.height = '30px';
+                cursor.style.borderRadius = '50%';
+                cursor.style.backgroundColor = 'rgba(255, 0, 0, 0.8)';
+                cursor.style.border = '2px solid white';
+                cursor.style.boxShadow = '0 0 10px rgba(0,0,0,0.5)';
+                cursor.style.pointerEvents = 'none';
+                cursor.style.zIndex = '2147483647';
+                cursor.style.transition = 'all 1s ease-in-out';
+                
+                // Start from center of screen if new
+                cursor.style.left = `${window.innerWidth / 2}px`;
+                cursor.style.top = `${window.innerHeight / 2}px`;
+                document.body.appendChild(cursor);
+                
+                // Force reflow
+                cursor.getBoundingClientRect();
+              }
+              if (el) {
+                const rect = el.getBoundingClientRect();
+                x = rect.left + rect.width / 2;
+                y = rect.top + rect.height / 2;
+              }
+              if (x != null && y != null) {
+                cursor.style.left = `${x - 15}px`;
+                cursor.style.top = `${y - 15}px`;
+              }
+              
+              // Wait for transition to finish
+              await new Promise(r => setTimeout(r, 1000));
+              return { x, y };
+            };
+
+            const highlightElement = (el) => {
+              if (!el) return null;
+              const overlay = document.createElement('div');
+              overlay.style.position = 'fixed';
+              overlay.style.pointerEvents = 'none';
+              overlay.style.zIndex = '2147483646';
+              overlay.style.backgroundColor = 'rgba(255, 255, 0, 0.3)';
+              overlay.style.border = '2px solid yellow';
+              overlay.style.borderRadius = '4px';
+              const rect = el.getBoundingClientRect();
+              overlay.style.left = `${rect.left}px`;
+              overlay.style.top = `${rect.top}px`;
+              overlay.style.width = `${rect.width}px`;
+              overlay.style.height = `${rect.height}px`;
+              document.body.appendChild(overlay);
+              setTimeout(() => {
+                if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+              }, 2000);
+              return overlay;
+            };
+
+            if (aType === 'move') {
+              if (!targetEl && (aX == null || aY == null)) return `Элемент не найден для move: ${aSelector || aNear}`;
+              if (targetEl) targetEl.scrollIntoView({ block: 'center', inline: 'center', behavior: 'smooth' });
+              const coords = await moveFakeCursor(targetEl, aX, aY);
+              return `Навели курсор на ${aSelector || aNear || `[${aX},${aY}]`} [${Math.round(coords.x)},${Math.round(coords.y)}]`;
+            }
+
+            if (aType === 'focus') {
+              if (!targetEl) return `Элемент не найден для focus: ${aSelector || aNear}`;
               targetEl.focus?.();
               await moveFakeCursor(targetEl, aX, aY);
+              return `Фокус на ${aSelector || aNear}`;
+            }
+
+            if (aType === 'press') {
+              const key = aKeys || '';
+              const tgt = targetEl || document.activeElement || document.body;
+              if (!tgt) return 'Нет элемента для press';
+              const eventInit = { key, code: key, bubbles: true, cancelable: true, composed: true, view: window };
+              tgt.dispatchEvent(new KeyboardEvent('keydown', eventInit));
+              tgt.dispatchEvent(new KeyboardEvent('keypress', eventInit));
+              tgt.dispatchEvent(new KeyboardEvent('keyup', eventInit));
+              return `Нажали клавишу ${key}`;
+            }
+
+            if (aType === 'scroll') {
+              if (aSelector) {
+                const el = pickElement(aSelector);
+                if (el) {
+                  el.scrollIntoView({ behavior: 'smooth', block: aDirection === 'up' ? 'start' : 'end' });
+                  await new Promise(r => setTimeout(r, 500));
+                  return `Прокрутили к элементу ${aSelector}`;
+                }
+              }
+              window.scrollBy({
+                top: aDirection === 'up' ? -aAmount : aDirection === 'down' ? aAmount : 0,
+                left: aDirection === 'left' ? -aAmount : aDirection === 'right' ? aAmount : 0,
+                behavior: 'smooth'
+              });
+              await new Promise(r => setTimeout(r, 500));
+              return `Прокрутили ${aDirection} на ${aAmount}px`;
+            }
+
+            if (aType === 'hover') {
+              if (!targetEl) return `Элемент не найден для hover: ${aSelector || aNear || `[${aX},${aY}]`}`;
+              highlightElement(targetEl);
+              targetEl.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true, cancelable: true, view: window }));
+              return `Навели на ${aSelector || aNear || `[${aX},${aY}]`}`;
+            }
+
+            if (aType === 'drag_and_drop') {
+              const fromEl = aFrom ? pickElement(aFrom) : null;
+              const toEl = aTo ? pickElement(aTo) : null;
+              if (!fromEl || !toEl) return `Не удалось найти элементы для drag_and_drop: from=${aFrom}, to=${aTo}`;
               
-              const textToType = aText || aValue || '';
+              const fromRect = fromEl.getBoundingClientRect();
+              const toRect = toEl.getBoundingClientRect();
+              const fromX = fromRect.left + fromRect.width / 2;
+              const fromY = fromRect.top + fromRect.height / 2;
+              const toX = toRect.left + toRect.width / 2;
+              const toY = toRect.top + toRect.height / 2;
               
-              if (targetEl.isContentEditable) {
-                targetEl.innerText = textToType;
-              } else {
-                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
-                const nativeTextAreaValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
-                
-                if (targetEl instanceof HTMLInputElement && nativeInputValueSetter) {
-                  nativeInputValueSetter.call(targetEl, textToType);
-                } else if (targetEl instanceof HTMLTextAreaElement && nativeTextAreaValueSetter) {
-                  nativeTextAreaValueSetter.call(targetEl, textToType);
-                } else {
-                  targetEl.value = textToType;
+              // Simulate drag
+              fromEl.dispatchEvent(new MouseEvent('mousedown', { clientX: fromX, clientY: fromY, bubbles: true }));
+              await new Promise(r => setTimeout(r, 100));
+              document.elementFromPoint(toX, toY)?.dispatchEvent(new MouseEvent('mousemove', { clientX: toX, clientY: toY, bubbles: true }));
+              await new Promise(r => setTimeout(r, 100));
+              toEl.dispatchEvent(new MouseEvent('mouseup', { clientX: toX, clientY: toY, bubbles: true }));
+              toEl.dispatchEvent(new MouseEvent('drop', { clientX: toX, clientY: toY, bubbles: true }));
+              
+              return `Перетащили с ${aFrom} на ${aTo}`;
+            }
+
+            if (aType === 'upload_file') {
+              if (!targetEl) return `Элемент не найден для upload_file: ${aSelector || aNear}`;
+              if (!(targetEl instanceof HTMLInputElement) || targetEl.type !== 'file') {
+                return `Элемент не является полем загрузки файла: ${aSelector || aNear}`;
+              }
+              // Note: Actual file upload requires user interaction, we can only set the value in some contexts
+              return `Загрузка файла ${aFilePath} в ${aSelector || aNear} (требует подтверждения)`;
+            }
+
+            if (aType === 'read_text') {
+              if (!targetEl) return `Элемент не найден для read_text: ${aSelector || aNear || `[${aX},${aY}]`}`;
+              const textContent = targetEl.innerText || targetEl.textContent || targetEl.value || '';
+              return `Прочитан текст: "${textContent}"`;
+            }
+
+            if (!targetEl) return `Элемент не найден: ${aSelector || aNear || `[${aX},${aY}]`}`;
+
+            if (aType === 'click' || aType === 'ocr_click') {
+              targetEl.focus?.();
+              const coords = await moveFakeCursor(targetEl, aX, aY);
+              highlightElement(targetEl);
+              
+              let cursor = document.getElementById('proaibro-fake-cursor');
+              if (cursor) {
+                cursor.style.backgroundColor = 'rgba(0, 255, 0, 0.8)';
+                cursor.style.transform = 'scale(0.8)';
+                setTimeout(() => {
+                  cursor.style.backgroundColor = 'rgba(255, 0, 0, 0.8)';
+                  cursor.style.transform = 'scale(1)';
+                }, 200);
+              }
+
+              const btn = aButton === 'right' ? 2 : aButton === 'middle' ? 1 : 0;
+              const eventInit = { bubbles: true, cancelable: true, composed: true, view: window, clientX: coords.x, clientY: coords.y, button: btn, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+              targetEl.dispatchEvent(new PointerEvent('pointerdown', eventInit));
+              targetEl.dispatchEvent(new MouseEvent('mousedown', eventInit));
+              targetEl.dispatchEvent(new PointerEvent('pointerup', eventInit));
+              targetEl.dispatchEvent(new MouseEvent('mouseup', eventInit));
+              targetEl.dispatchEvent(new MouseEvent('click', eventInit));
+              return `Клик (${aButton}) по ${aSelector || aNear || `[${aX},${aY}]`}`;
+            }
+
+            if (aType === 'input' || aType === 'ocr_input') {
+              if (!('value' in targetEl) && !targetEl.isContentEditable) {
+                if (document.activeElement && ('value' in document.activeElement || document.activeElement.isContentEditable)) {
+                  targetEl = document.activeElement;
                 }
               }
               
-              targetEl.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-              targetEl.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-              return `Ввод в ${aSelector || aNear || `[${aX},${aY}]`}: ${textToType}`;
+              if ('value' in targetEl || targetEl.isContentEditable) {
+                targetEl.focus?.();
+                await moveFakeCursor(targetEl, aX, aY);
+                highlightElement(targetEl);
+                
+                const textToType = aText || aValue || '';
+                
+                if (targetEl.isContentEditable) {
+                  targetEl.innerText = textToType;
+                } else {
+                  const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+                  const nativeTextAreaValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+                  
+                  if (targetEl instanceof HTMLInputElement && nativeInputValueSetter) {
+                    nativeInputValueSetter.call(targetEl, textToType);
+                  } else if (targetEl instanceof HTMLTextAreaElement && nativeTextAreaValueSetter) {
+                    nativeTextAreaValueSetter.call(targetEl, textToType);
+                  } else {
+                    targetEl.value = textToType;
+                  }
+                }
+                
+                targetEl.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                targetEl.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                return `Ввод в ${aSelector || aNear || `[${aX},${aY}]`}: ${textToType}`;
+              }
+              return `Элемент (${targetEl.tagName}) не поддерживает value: ${aSelector || aNear || `[${aX},${aY}]`}`;
             }
-            return `Элемент (${targetEl.tagName}) не поддерживает value: ${aSelector || aNear || `[${aX},${aY}]`}`;
-          }
 
-          if (aType === 'select') {
-            if (!(targetEl instanceof HTMLSelectElement)) return `Элемент не <select>: ${aSelector || aNear}`;
-            const options = Array.from(targetEl.options || []);
-            let applied = false;
-            if (aValue != null) {
-              const v = String(aValue);
-              const found = options.find(o => o.value === v);
-              if (found) { targetEl.value = v; applied = true; }
+            if (aType === 'select') {
+              if (!(targetEl instanceof HTMLSelectElement)) return `Элемент не <select>: ${aSelector || aNear}`;
+              const options = Array.from(targetEl.options || []);
+              let applied = false;
+              if (aValue != null) {
+                const v = String(aValue);
+                const found = options.find(o => o.value === v);
+                if (found) { targetEl.value = v; applied = true; }
+              }
+              if (!applied && aLabel != null) {
+                const lbl = String(aLabel).toLowerCase();
+                const found = options.find(o => (o.label || o.textContent || '').toLowerCase() === lbl);
+                if (found) { targetEl.value = found.value; applied = true; }
+              }
+              if (!applied && aIndex != null && !Number.isNaN(Number(aIndex))) {
+                const idx = Math.max(0, Math.min(options.length - 1, Number(aIndex)));
+                if (options[idx]) { targetEl.selectedIndex = idx; applied = true; }
+              }
+              if (applied) {
+                targetEl.dispatchEvent(new Event('input', { bubbles: true }));
+                targetEl.dispatchEvent(new Event('change', { bubbles: true }));
+                return `Выбрано в ${aSelector || aNear}`;
+              }
+              return `Не удалось выбрать опцию в ${aSelector || aNear}`;
             }
-            if (!applied && aLabel != null) {
-              const lbl = String(aLabel).toLowerCase();
-              const found = options.find(o => (o.label || o.textContent || '').toLowerCase() === lbl);
-              if (found) { targetEl.value = found.value; applied = true; }
-            }
-            if (!applied && aIndex != null && !Number.isNaN(Number(aIndex))) {
-              const idx = Math.max(0, Math.min(options.length - 1, Number(aIndex)));
-              if (options[idx]) { targetEl.selectedIndex = idx; applied = true; }
-            }
-            if (applied) {
-              targetEl.dispatchEvent(new Event('input', { bubbles: true }));
-              targetEl.dispatchEvent(new Event('change', { bubbles: true }));
-              return `Выбрано в ${aSelector || aNear}`;
-            }
-            return `Не удалось выбрать опцию в ${aSelector || aNear}`;
-          }
 
-          return `Неизвестный тип действия: ${aType}`;
+            return `Неизвестный тип действия: ${aType}`;
+          }
+        });
+        
+        let successRes = null;
+        let errorRes = null;
+        for (const r of resultsArr) {
+          if (r.result && !r.result.startsWith('Элемент не найден')) {
+            successRes = r.result;
+            break;
+          } else if (r.result) {
+            errorRes = r.result;
+          }
         }
-      });
-      
-      let successRes = null;
-      let errorRes = null;
-      for (const r of resultsArr) {
-        if (r.result && !r.result.startsWith('Элемент не найден')) {
-          successRes = r.result;
-          break;
-        } else if (r.result) {
-          errorRes = r.result;
+        const resultMsg = successRes || errorRes || 'Действие выполнено';
+        results.push(resultMsg);
+        agentActionHistory.push(`${type}: ${resultMsg}`);
+        lastError = null;
+        break; // Успешное выполнение, выходим из цикла повторов
+      } catch (err) {
+        lastError = err;
+        if (retry < ACTION_RETRY_COUNT) {
+          await sleep(500); // Задержка перед повторной попыткой
+          continue;
         }
+        results.push(`Ошибка при ${type}:${selector || ''} — ${err.message}`);
+        agentActionHistory.push(`Ошибка ${type}: ${err.message}`);
       }
-      results.push(successRes || errorRes || 'Действие выполнено');
-    } catch (err) {
-      results.push(`Ошибка при ${type}:${selector || ''} — ${err.message}`);
     }
   }
   return results.join('\n');
 }
 
 async function buildDomInventory(tabId) {
+  // Проверка кэша
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (tab?.id === tabId && lastInventory) {
+    return lastInventory;
+  }
+
   try {
     const resultsArr = await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
@@ -682,9 +882,21 @@ async function buildDomInventory(tabId) {
           return result;
         };
 
+        const isVisible = (el) => {
+          if (!el || !(el instanceof Element)) return false;
+          const style = window.getComputedStyle(el);
+          if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+          const rect = el.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) return false;
+          if (rect.top > window.innerHeight || rect.bottom < 0 || rect.left > window.innerWidth || rect.right < 0) return false;
+          return el.offsetParent !== null;
+        };
+
         const items = [];
         const nodes = querySelectorAllDeep('input, textarea, button, select, [role="button"], [role="textbox"], [contenteditable="true"]');
         for (const el of nodes.slice(0, limit)) {
+          if (!isVisible(el)) continue; // Пропускаем невидимые элементы
+
           let text = '';
           if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
             text = el.placeholder || '';
@@ -703,6 +915,7 @@ async function buildDomInventory(tabId) {
           text = (text || '').trim();
           if (text.length > textMax) text = text.slice(0, textMax);
 
+          const rect = el.getBoundingClientRect();
           const role = el instanceof HTMLButtonElement || el.getAttribute('role') === 'button' ? 'button'
             : (el instanceof HTMLSelectElement ? 'select'
             : (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el.getAttribute('role') === 'textbox' || el.isContentEditable ? 'input' : 'other'));
@@ -711,7 +924,11 @@ async function buildDomInventory(tabId) {
             selector: getUniqueSelector(el),
             text,
             tag: el.tagName.toLowerCase(),
-            role
+            role,
+            x: Math.round(rect.left + rect.width / 2),
+            y: Math.round(rect.top + rect.height / 2),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height)
           });
         }
         return items;
@@ -736,6 +953,7 @@ async function buildDomInventory(tabId) {
         }
       }
     }
+    lastInventory = allItems; // Сохраняем в кэш
     return allItems;
   } catch (err) {
     console.warn('buildDomInventory failed', err);
@@ -948,6 +1166,9 @@ document.getElementById('sendBtn').addEventListener('click', async () => {
   btn.disabled = true;
   btn.textContent = 'Обработка...';
   stopBtn.disabled = false;
+  agentIteration = 0;
+  agentActionHistory = [];
+  lastInventory = null;
 
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -958,94 +1179,118 @@ document.getElementById('sendBtn').addEventListener('click', async () => {
       return;
     }
 
-    const results = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: () => ({
-        title: document.title || 'Без названия',
-        text: document.body ? document.body.innerText : ''
-      })
-    });
+    // Цикл итераций агента
+    let currentQuery = userQuery;
+    let allResponses = [];
+    let continueAgentLoop = true;
 
-    const extracted = results?.[0]?.result || { title: tab.title || 'Без названия', text: '' };
-    const { title, text } = extracted;
+    while (continueAgentLoop && agentIteration < MAX_AGENT_ITERATIONS) {
+      agentIteration++;
 
-    await chrome.storage.session.set({
-      pageExtractedTitle: title,
-      pageExtractedText: text,
-      pageExtractedUrl: tab.url || ''
-    });
-    await loadPageFromStorage();
+      const results = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: () => ({
+          title: document.title || 'Без названия',
+          text: document.body ? document.body.innerText : ''
+        })
+      });
 
-    getEl('summaryLoading').style.display = 'block';
-    const screenshotDataUrl = await getCompressedScreenshotDataUrl();
-    const inventory = await buildDomInventory(tab.id);
-    const inventorySummary = buildInventorySummary(inventory);
-    let responseText;
-    try {
-      const trimmedScreenshot = screenshotDataUrl && screenshotDataUrl.length > SCREENSHOT_MAX_CHARS
-        ? screenshotDataUrl.slice(0, SCREENSHOT_MAX_CHARS)
-        : screenshotDataUrl;
-      responseText = await sendQueryToModel(text, userQuery, isAgentMode, trimmedScreenshot, inventorySummary);
-    } catch (err) {
-      if (err.name === 'AbortError') {
-        console.log('Запрос отменён пользователем');
-        responseText = 'Запрос отменён.';
+      const extracted = results?.[0]?.result || { title: tab.title || 'Без названия', text: '' };
+      const { title, text } = extracted;
+
+      await chrome.storage.session.set({
+        pageExtractedTitle: title,
+        pageExtractedText: text,
+        pageExtractedUrl: tab.url || ''
+      });
+      await loadPageFromStorage();
+
+      getEl('summaryLoading').style.display = 'block';
+      const screenshotDataUrl = await getCompressedScreenshotDataUrl();
+      const inventory = await buildDomInventory(tab.id);
+      const inventorySummary = buildInventorySummary(inventory);
+      let responseText;
+      try {
+        const trimmedScreenshot = screenshotDataUrl && screenshotDataUrl.length > SCREENSHOT_MAX_CHARS
+          ? screenshotDataUrl.slice(0, SCREENSHOT_MAX_CHARS)
+          : screenshotDataUrl;
+        responseText = await sendQueryToModel(text, currentQuery, isAgentMode, trimmedScreenshot, inventorySummary, agentActionHistory);
+      } catch (err) {
+        if (err.name === 'AbortError') {
+          console.log('Запрос отменён пользователем');
+          responseText = 'Запрос отменён.';
+        } else {
+          console.error('Query failed:', err);
+          responseText = 'Ошибка: ' + err.message;
+        }
+      }
+      getEl('summaryLoading').style.display = 'none';
+
+      const titleSnippet = currentQuery.slice(0, 50);
+      allResponses.push(responseText);
+
+      if (isPrivateMode) {
+        await appendPrivateMessage('user', agentIteration === 1 ? userQuery : `Итерация ${agentIteration}: ${currentQuery}`);
+        await appendPrivateMessage('assistant', responseText);
+        const messages = await getPrivateMessages();
+        renderMessages(messages);
       } else {
-        console.error('Query failed:', err);
-        responseText = 'Ошибка: ' + err.message;
+        if (!currentChatId) currentChatId = createChatId();
+        await appendMessageToLocalChat(currentChatId, 'user', agentIteration === 1 ? userQuery : `Итерация ${agentIteration}: ${currentQuery}`, titleSnippet);
+        await appendMessageToLocalChat(currentChatId, 'assistant', responseText);
+        const chats = await getChats();
+        renderMessages((chats[currentChatId] || {}).messages || []);
+        renderHistoryList();
+      }
+
+      if (isAgentMode && responseText !== 'Запрос отменён.') {
+        const parsed = extractActionsFromResponse(responseText);
+        if (parsed?.actions && parsed.actions.length > 0) {
+          const execResult = await runAgentActions(parsed.actions);
+          const followup = `Результат выполнения действий (итерация ${agentIteration}):\n${execResult}`;
+          
+          if (isPrivateMode) {
+            await appendPrivateMessage('assistant', followup);
+            const messages = await getPrivateMessages();
+            renderMessages(messages);
+          } else {
+            await appendMessageToLocalChat(currentChatId, 'assistant', followup);
+            const chats = await getChats();
+            renderMessages((chats[currentChatId] || {}).messages || []);
+            renderHistoryList();
+          }
+
+          // Подготовка для следующей итерации
+          if (agentIteration < MAX_AGENT_ITERATIONS) {
+            currentQuery = `Проанализируй текущее состояние страницы после выполненных действий. Достигнута ли цель запроса "${userQuery}"? Если нет, какие следующие действия нужно выполнить?`;
+            await sleep(1000); // Пауза между итерациями
+          }
+        } else {
+          continueAgentLoop = false; // Нет действий, завершаем цикл
+        }
+      } else {
+        continueAgentLoop = false; // Не агентский режим или запрос отменён
       }
     }
-    getEl('summaryLoading').style.display = 'none';
 
-    const titleSnippet = userQuery.slice(0, 50);
-
-    if (isPrivateMode) {
-      await appendPrivateMessage('user', userQuery);
-      await appendPrivateMessage('assistant', responseText);
-      const messages = await getPrivateMessages();
-      renderMessages(messages);
-    } else {
-      if (!currentChatId) currentChatId = createChatId();
-      await appendMessageToLocalChat(currentChatId, 'user', userQuery, titleSnippet);
-      await appendMessageToLocalChat(currentChatId, 'assistant', responseText);
-      const chats = await getChats();
-      renderMessages((chats[currentChatId] || {}).messages || []);
-      renderHistoryList();
-    }
-
-    if (isAgentMode && responseText !== 'Запрос отменён.') {
-      const parsed = extractActionsFromResponse(responseText);
-      if (parsed?.actions) {
-        const execResult = await runAgentActions(parsed.actions);
-        const followup = `Результат выполнения действий:\n${execResult}`;
-        if (isPrivateMode) {
-          await appendPrivateMessage('assistant', followup);
-          const messages = await getPrivateMessages();
-          renderMessages(messages);
-        } else {
-          await appendMessageToLocalChat(currentChatId, 'assistant', followup);
-          const chats = await getChats();
-          renderMessages((chats[currentChatId] || {}).messages || []);
-          renderHistoryList();
-        }
+    if (agentIteration > 1 && isAgentMode) {
+      const summary = `Цикл агента завершён (${agentIteration} итераций).`;
+      if (isPrivateMode) {
+        await appendPrivateMessage('assistant', summary);
+        const messages = await getPrivateMessages();
+        renderMessages(messages);
       } else {
-        const notice = 'Агент: действий не найдено или JSON нераспознан.';
-        if (isPrivateMode) {
-          await appendPrivateMessage('assistant', notice);
-          const messages = await getPrivateMessages();
-          renderMessages(messages);
-        } else {
-          await appendMessageToLocalChat(currentChatId, 'assistant', notice);
-          const chats = await getChats();
-          renderMessages((chats[currentChatId] || {}).messages || []);
-          renderHistoryList();
-        }
+        await appendMessageToLocalChat(currentChatId, 'assistant', summary);
+        const chats = await getChats();
+        renderMessages((chats[currentChatId] || {}).messages || []);
+        renderHistoryList();
       }
     }
 
     queryInput.value = '';
   } catch (err) {
     getEl('summaryLoading').style.display = 'none';
+    console.error('Agent loop error:', err);
   }
   btn.textContent = 'Отправить запрос';
   btn.disabled = false;
