@@ -20,6 +20,7 @@ let apiKey = null;
 let currentChatId = null;
 let isPrivateMode = false;
 let isAgentMode = false;
+let abortController = null;
 
 async function loadApiKey() {
   try {
@@ -196,8 +197,10 @@ ${pageText}
       ] }
     : { role: 'user', content: userText };
 
+  abortController = new AbortController();
   const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
+    signal: abortController.signal,
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${apiKey}`,
@@ -219,6 +222,7 @@ ${pageText}
     throw new Error(`OpenRouter API error: ${response.status} - ${errorText}`);
   }
   const data = await response.json();
+  abortController = null;
   return data.choices[0]?.message?.content || 'Нет ответа от модели';
 }
 
@@ -933,6 +937,7 @@ getEl('agentModeBtn').addEventListener('click', async () => {
 
 document.getElementById('sendBtn').addEventListener('click', async () => {
   const btn = getEl('sendBtn');
+  const stopBtn = getEl('stopBtn');
   const queryInput = getEl('queryInput');
   const userQuery = queryInput.value.trim();
   if (!userQuery) {
@@ -942,12 +947,14 @@ document.getElementById('sendBtn').addEventListener('click', async () => {
 
   btn.disabled = true;
   btn.textContent = 'Обработка...';
+  stopBtn.disabled = false;
 
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id) {
       btn.textContent = 'Ошибка: нет вкладки';
       btn.disabled = false;
+      stopBtn.disabled = true;
       return;
     }
 
@@ -980,8 +987,13 @@ document.getElementById('sendBtn').addEventListener('click', async () => {
         : screenshotDataUrl;
       responseText = await sendQueryToModel(text, userQuery, isAgentMode, trimmedScreenshot, inventorySummary);
     } catch (err) {
-      console.error('Query failed:', err);
-      responseText = 'Ошибка: ' + err.message;
+      if (err.name === 'AbortError') {
+        console.log('Запрос отменён пользователем');
+        responseText = 'Запрос отменён.';
+      } else {
+        console.error('Query failed:', err);
+        responseText = 'Ошибка: ' + err.message;
+      }
     }
     getEl('summaryLoading').style.display = 'none';
 
@@ -1001,7 +1013,7 @@ document.getElementById('sendBtn').addEventListener('click', async () => {
       renderHistoryList();
     }
 
-    if (isAgentMode) {
+    if (isAgentMode && responseText !== 'Запрос отменён.') {
       const parsed = extractActionsFromResponse(responseText);
       if (parsed?.actions) {
         const execResult = await runAgentActions(parsed.actions);
@@ -1037,6 +1049,14 @@ document.getElementById('sendBtn').addEventListener('click', async () => {
   }
   btn.textContent = 'Отправить запрос';
   btn.disabled = false;
+  stopBtn.disabled = true;
+});
+
+document.getElementById('stopBtn').addEventListener('click', () => {
+  if (abortController) {
+    abortController.abort();
+    abortController = null;
+  }
 });
 
 loadApiKey();

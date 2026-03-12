@@ -26,6 +26,12 @@ body {
   box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.1);
 }
 
+.request-buttons {
+  display: flex;
+  gap: 12px;
+  margin-top: 12px;
+}
+
 .query-input {
   width: 100%;
   margin-bottom: 12px;
@@ -51,7 +57,7 @@ body {
 }
 
 .btn-primary {
-  width: 100%;
+  flex: 1;
   padding: 10px 16px;
   font-size: 14px;
   font-weight: 500;
@@ -67,6 +73,27 @@ body {
 }
 
 .btn-primary:disabled {
+  background: #9aa0a6;
+  cursor: not-allowed;
+}
+
+.btn-stop {
+  flex: 1;
+  padding: 10px 16px;
+  font-size: 14px;
+  font-weight: 500;
+  color: #fff;
+  background: #d93025;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.btn-stop:hover {
+  background: #b3261e;
+}
+
+.btn-stop:disabled {
   background: #9aa0a6;
   cursor: not-allowed;
 }

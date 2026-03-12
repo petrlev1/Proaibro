@@ -37,7 +37,10 @@
   </main>
   <div class="request-bar">
     <textarea id="queryInput" class="query-input" placeholder="Введите запрос к модели (например: Сделай краткое содержание текста)" rows="3"></textarea>
-    <button id="sendBtn" class="btn btn-primary">Отправить запрос</button>
+    <div class="request-buttons">
+      <button id="sendBtn" class="btn btn-primary">Отправить запрос</button>
+      <button id="stopBtn" class="btn btn-stop" disabled>Стоп</button>
+    </div>
   </div>
   <script src="viewer.js"></script>
 </body>
