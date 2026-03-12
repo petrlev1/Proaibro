@@ -205,7 +205,7 @@ ${pageText}
       'X-Title': 'Proaibro'
     },
     body: JSON.stringify({
-      model: 'anthropic/claude-opus-4.6',
+      model: 'qwen/qwen3.5-9b',
       messages: [
         { role: 'system', content: systemPrompt },
         userMessage
